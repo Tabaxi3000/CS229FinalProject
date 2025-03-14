@@ -405,27 +405,85 @@ def main():
     np.random.seed(42)
     
     if args.train:
-        # Create environment and agent
-        env = ImprovedGinRummyEnv()
-        agent = REINFORCEAgent()
+        # Create environments and agents
+        env_reinforce = ImprovedGinRummyEnv()
+        env_dqn = ImprovedGinRummyEnv()
+        env_mcts = ImprovedGinRummyEnv()
         
-        # Disable all printing from environment
-        env.print_state = lambda: None
-        env.print_action = lambda x: None
-        env.print_reward = lambda x: None
+        reinforce_agent = REINFORCEAgent()
+        dqn_agent = ImprovedDQNAgent()
+        mcts_agent = MCTSAgent()
         
-        # Train agent
-        metrics = train_reinforce(
-            env=env,
-            agent=agent,
-            num_episodes=args.episodes,
-            eval_interval=100
-        )
+        # Disable all printing from environments
+        for env in [env_reinforce, env_dqn, env_mcts]:
+            env.print_state = lambda: None
+            env.print_action = lambda x: None
+            env.print_reward = lambda x: None
+        
+        # Dictionary to store metrics for all agents
+        all_metrics = {
+            'reinforce': {'metrics': None, 'agent': reinforce_agent},
+            'dqn': {'metrics': None, 'agent': dqn_agent},
+            'mcts': {'metrics': None, 'agent': mcts_agent}
+        }
+        
+        try:
+            print("Starting parallel training of all agents...")
+            print("Press Ctrl+C to stop training and save current progress")
+            
+            # Train REINFORCE
+            metrics_reinforce = train_reinforce(
+                env=env_reinforce,
+                agent=reinforce_agent,
+                num_episodes=args.episodes,
+                eval_interval=100
+            )
+            all_metrics['reinforce']['metrics'] = metrics_reinforce
+            
+            # Train DQN
+            metrics_dqn = train_dqn(
+                env=env_dqn,
+                agent=dqn_agent,
+                num_episodes=args.episodes,
+                eval_interval=100
+            )
+            all_metrics['dqn']['metrics'] = metrics_dqn
+            
+            # Train MCTS
+            metrics_mcts = train_mcts(
+                env=env_mcts,
+                agent=mcts_agent,
+                num_episodes=args.episodes,
+                eval_interval=100
+            )
+            all_metrics['mcts']['metrics'] = metrics_mcts
+            
+        except KeyboardInterrupt:
+            print("\nTraining interrupted! Saving current progress...")
+            
+            # Save all agents' current state
+            for name, data in all_metrics.items():
+                if data['metrics'] is not None:
+                    save_path = os.path.join('models', f'{name}_interrupted.pt')
+                    data['agent'].save(save_path)
+                    print(f"Saved {name} model to {save_path}")
+            
+            print("All progress saved. You can resume training later.")
+            return
+        
+        # Save final models
+        for name, data in all_metrics.items():
+            if data['metrics'] is not None:
+                save_path = os.path.join('models', f'{name}_final.pt')
+                data['agent'].save(save_path)
+                print(f"Saved {name} model to {save_path}")
     
     if args.evaluate:
         # Create environment and agents
         env = ImprovedGinRummyEnv()
-        agent = REINFORCEAgent()
+        reinforce_agent = REINFORCEAgent()
+        dqn_agent = ImprovedDQNAgent()
+        mcts_agent = MCTSAgent()
         rules_agent = RulesBasedAgent()
         
         # Disable environment printing
@@ -433,21 +491,31 @@ def main():
         env.print_action = lambda x: None
         env.print_reward = lambda x: None
         
-        # Load latest model if available
-        model_files = [f for f in os.listdir('models') if f.startswith('reinforce_episode_')]
-        if model_files:
-            latest_model = max(model_files, key=lambda x: int(x.split('_')[2].split('.')[0]))
-            print(f"Loading model: {latest_model}")
-            agent.load_model(os.path.join('models', latest_model))
+        # Load latest models if available
+        for agent_name, agent in [
+            ('reinforce', reinforce_agent),
+            ('dqn', dqn_agent),
+            ('mcts', mcts_agent)
+        ]:
+            model_files = [f for f in os.listdir('models') if f.startswith(f'{agent_name}_')]
+            if model_files:
+                latest_model = max(model_files, key=lambda x: int(x.split('_')[2].split('.')[0]) if x.split('_')[2].split('.')[0].isdigit() else 0)
+                print(f"Loading {agent_name} model: {latest_model}")
+                agent.load(os.path.join('models', latest_model))
         
-        # Evaluate against rules-based agent
-        final_reward = evaluate_against_rules(
-            agent=agent,
-            opponent=rules_agent,
-            env=env,
-            num_games=args.eval_games
-        )
-        print(f"Final evaluation reward against rules-based agent: {final_reward:.2f}")
+        # Evaluate all agents against rules-based agent
+        for agent_name, agent in [
+            ('REINFORCE', reinforce_agent),
+            ('DQN', dqn_agent),
+            ('MCTS', mcts_agent)
+        ]:
+            final_reward = evaluate_against_rules(
+                agent=agent,
+                opponent=rules_agent,
+                env=env,
+                num_games=args.eval_games
+            )
+            print(f"{agent_name} evaluation reward against rules-based agent: {final_reward:.2f}")
 
 if __name__ == "__main__":
     main() 
