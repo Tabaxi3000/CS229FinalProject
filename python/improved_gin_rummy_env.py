@@ -13,7 +13,7 @@ GIN = 109
 class ImprovedGinRummyEnv:
     """An improved Gin Rummy environment with reward shaping for better learning."""
     
-    def __init__(self, reward_shaping=True, deadwood_reward_scale=0.01, meld_reward=0.05, win_reward=1.0, gin_reward=1.5, knock_reward=0.5):
+    def __init__(self, reward_shaping=True, deadwood_reward_scale=0.01, meld_reward=0.05, win_reward=1.0, gin_reward=1.5, knock_reward=0.5, verbose=False):
         self.current_player = 0
         self.deck = list(range(52))
         self.discard_pile = []
@@ -27,6 +27,7 @@ class ImprovedGinRummyEnv:
         self.knock_reward = knock_reward  # Added explicit knock reward
         self.previous_deadwood = [100, 100]  # Initialize with high values
         self.previous_melds_count = [0, 0]  # Track number of melds
+        self.verbose = verbose
         
         # Debug counters
         self.gin_opportunities = 0
@@ -34,9 +35,10 @@ class ImprovedGinRummyEnv:
         self.gin_taken = 0
         self.knock_taken = 0
         
-        # Print constants for debugging
-        print(f"Environment constants - GIN: {GIN}, KNOCK: {KNOCK}")
-        print(f"Reward structure - win: {self.win_reward}, gin: {self.gin_reward}, knock: {self.knock_reward}")
+        # Print constants only if verbose
+        if self.verbose:
+            print(f"Environment constants - GIN: {GIN}, KNOCK: {KNOCK}")
+            print(f"Reward structure - win: {self.win_reward}, gin: {self.gin_reward}, knock: {self.knock_reward}")
         
     def reset(self):
         """Reset the environment to start a new game."""
@@ -88,10 +90,10 @@ class ImprovedGinRummyEnv:
         prev_melds_count = self.previous_melds_count[self.current_player]
         
         # Debug action
-        if action == GIN:
+        if action == GIN and self.verbose:
             print(f"GIN action taken by player {self.current_player}")
             self.gin_taken += 1
-        elif action == KNOCK:
+        elif action == KNOCK and self.verbose:
             print(f"KNOCK action taken by player {self.current_player}")
             self.knock_taken += 1
         
@@ -166,11 +168,13 @@ class ImprovedGinRummyEnv:
             # Knock
             if self.phase == 'discard':
                 deadwood = self._calculate_deadwood(self.player_hands[self.current_player])
-                print(f"KNOCK attempt with deadwood: {deadwood}")
+                if self.verbose:
+                    print(f"KNOCK attempt with deadwood: {deadwood}")
                 if deadwood <= 10:
                     # Valid knock
                     opponent_deadwood = self._calculate_deadwood(self.player_hands[1 - self.current_player])
-                    print(f"KNOCK: Player deadwood: {deadwood}, Opponent deadwood: {opponent_deadwood}")
+                    if self.verbose:
+                        print(f"KNOCK: Player deadwood: {deadwood}, Opponent deadwood: {opponent_deadwood}")
                     
                     # Add explicit knock reward regardless of outcome
                     shaped_reward += self.knock_reward
@@ -180,50 +184,45 @@ class ImprovedGinRummyEnv:
                     info['opponent_deadwood'] = opponent_deadwood
                     
                     if deadwood < opponent_deadwood:
-                        print(f"KNOCK WIN: Player {self.current_player} wins with {deadwood} vs {opponent_deadwood}")
-                        # CRITICAL FIX: Always give positive reward for winning
-                        reward = self.win_reward  # Win with configurable reward
+                        if self.verbose:
+                            print(f"KNOCK WIN: Player {self.current_player} wins with {deadwood} vs {opponent_deadwood}")
+                        reward = self.win_reward
                         shaped_reward += self.win_reward
-                        # Set outcome in info dictionary
                         info['outcome'] = 'win'
                         info['original_reward'] = self.win_reward
-                        # Bonus for winning with low deadwood
                         if self.reward_shaping:
                             shaped_reward += (10 - deadwood) * 0.05
                     elif deadwood > opponent_deadwood:
-                        print(f"KNOCK LOSS: Player {self.current_player} loses with {deadwood} vs {opponent_deadwood}")
-                        reward = -self.win_reward  # Loss (negative win reward)
+                        if self.verbose:
+                            print(f"KNOCK LOSS: Player {self.current_player} loses with {deadwood} vs {opponent_deadwood}")
+                        reward = -self.win_reward
                         shaped_reward = -self.win_reward
-                        # Set outcome in info dictionary
                         info['outcome'] = 'loss'
                         info['original_reward'] = -self.win_reward
                     else:
-                        print(f"KNOCK DRAW: Player {self.current_player} draws with {deadwood}")
-                        reward = 0  # Draw
+                        if self.verbose:
+                            print(f"KNOCK DRAW: Player {self.current_player} draws with {deadwood}")
+                        reward = 0
                         shaped_reward = 0
-                        # Set outcome in info dictionary
                         info['outcome'] = 'draw'
                         info['original_reward'] = 0
                     
-                    # CRITICAL FIX: Always end the game after KNOCK
                     done = True
                 else:
-                    # Invalid knock (deadwood > 10)
-                    print(f"INVALID KNOCK: Player {self.current_player} has {deadwood} deadwood (> 10)")
+                    if self.verbose:
+                        print(f"INVALID KNOCK: Player {self.current_player} has {deadwood} deadwood (> 10)")
                     reward = -1
                     shaped_reward = -1
                     done = True
-                    # Set outcome in info dictionary
                     info['outcome'] = 'invalid_knock'
                     info['original_reward'] = -1
                     info['player_deadwood'] = deadwood
             else:
-                # Invalid action
-                print(f"INVALID KNOCK: Not in discard phase")
+                if self.verbose:
+                    print(f"INVALID KNOCK: Not in discard phase")
                 reward = -1
                 shaped_reward = -1
                 done = True
-                # Set outcome in info dictionary
                 info['outcome'] = 'invalid_action'
                 info['original_reward'] = -1
                 
@@ -231,41 +230,33 @@ class ImprovedGinRummyEnv:
             # Gin
             if self.phase == 'discard':
                 deadwood = self._calculate_deadwood(self.player_hands[self.current_player])
-                print(f"GIN attempt with deadwood: {deadwood}")
+                if self.verbose:
+                    print(f"GIN attempt with deadwood: {deadwood}")
                 if deadwood == 0:
-                    # Valid gin
-                    print(f"VALID GIN: Player {self.current_player} wins with gin!")
-                    # CRITICAL FIX: Always give positive reward for winning with gin
-                    reward = self.gin_reward  # Gin with configurable reward
-                    shaped_reward = self.gin_reward  # Extra reward for gin
-                    
-                    # Set outcome in info dictionary
+                    if self.verbose:
+                        print(f"VALID GIN: Player {self.current_player} wins with gin!")
+                    reward = self.gin_reward
+                    shaped_reward = self.gin_reward
                     info['outcome'] = 'gin'
                     info['original_reward'] = self.gin_reward
                     info['player_deadwood'] = 0
                     info['opponent_deadwood'] = self._calculate_deadwood(self.player_hands[1 - self.current_player])
-                    
-                    # CRITICAL FIX: Always end the game after GIN
                     done = True
                 else:
-                    # Invalid gin (deadwood > 0)
-                    print(f"INVALID GIN: Player {self.current_player} has {deadwood} deadwood (> 0)")
+                    if self.verbose:
+                        print(f"INVALID GIN: Player {self.current_player} has {deadwood} deadwood (> 0)")
                     reward = -1
                     shaped_reward = -1
                     done = True
-                    
-                    # Set outcome in info dictionary
                     info['outcome'] = 'invalid_gin'
                     info['original_reward'] = -1
                     info['player_deadwood'] = deadwood
             else:
-                # Invalid action
-                print(f"INVALID GIN: Not in discard phase")
+                if self.verbose:
+                    print(f"INVALID GIN: Not in discard phase")
                 reward = -1
                 shaped_reward = -1
                 done = True
-                
-                # Set outcome in info dictionary
                 info['outcome'] = 'invalid_action'
                 info['original_reward'] = -1
         
@@ -298,7 +289,6 @@ class ImprovedGinRummyEnv:
             hand_matrix[0, suit, rank] = 1
         
         # Create discard history
-        # Create a batch dimension and ensure it's 3D: [batch_size, seq_len, features]
         discard_history = torch.zeros(1, 10, 52)  # [batch_size, seq_len, card_idx]
         for i, card in enumerate(self.discard_pile[-10:]):
             discard_history[0, i, card] = 1
@@ -319,31 +309,13 @@ class ImprovedGinRummyEnv:
             # Check if can knock or gin
             deadwood = self._calculate_deadwood(self.player_hands[self.current_player])
             
-            # Print detailed information about the hand and melds
-            if self.current_player == 0:  # Only for the learning agent
-                melds = self._find_melds(self.player_hands[self.current_player])
-                deadwood_cards = set(self.player_hands[self.current_player])
-                for meld in melds:
-                    for card in meld:
-                        if card in deadwood_cards:
-                            deadwood_cards.remove(card)
-                
-                print(f"\nPlayer {self.current_player} hand: {self._format_cards(self.player_hands[self.current_player])}")
-                print(f"Melds found: {[self._format_cards(meld) for meld in melds]}")
-                print(f"Deadwood cards: {self._format_cards(list(deadwood_cards))}")
-                print(f"Deadwood count: {deadwood}")
-            
             if deadwood <= 10:
                 valid_actions_mask[KNOCK] = 1
                 self.knock_opportunities += 1
-                if self.current_player == 0:  # Only log for the learning agent
-                    print(f"KNOCK opportunity: Player {self.current_player} has {deadwood} deadwood")
             
             if deadwood == 0:
                 valid_actions_mask[GIN] = 1
                 self.gin_opportunities += 1
-                if self.current_player == 0:  # Only log for the learning agent
-                    print(f"GIN opportunity: Player {self.current_player} has 0 deadwood")
         
         # Create opponent model (for MCTS)
         opponent_model = torch.zeros(52)

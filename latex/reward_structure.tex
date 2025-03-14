@@ -2,27 +2,28 @@
 
 \subsubsection{Reward Structure}
 
-The reward function is implemented in the environment but with model-specific scaling factors. The base reward structure $R(s,a,s')$ combines terminal rewards with intermediate reward shaping:
+Our reward system combines end-game outcomes with intermediate feedback to guide the learning process. Players receive rewards not just for winning, but also for making strategic moves that improve their position. When reward shaping is enabled, the total reward $R(s,a,s')$ includes both terminal and intermediate rewards:
 
 \[
 R(s,a,s') = \begin{cases}
-R_{terminal}(s,a,s') & \text{if } \text{reward\_shaping} = \text{False} \\
-R_{terminal}(s,a,s') + R_{shaped}(s,a,s') & \text{otherwise}
+R_{terminal}(s,a,s') & \text{without shaping} \\
+R_{terminal}(s,a,s') + R_{shaped}(s,a,s') & \text{with shaping}
 \end{cases}
 \]
 
-The terminal rewards $R_{terminal}$ are defined with model-specific scaling:
+Terminal rewards reflect match outcomes, with different scaling factors ($\alpha$) depending on how the game ends:
 \[
 R_{terminal}(s,a,s') = \begin{cases}
-\alpha_{gin} & \text{if gin} \\
-\alpha_{win} & \text{if knock and win} \\
--\alpha_{win} & \text{if knock and lose} \\
--1.0 & \text{if invalid action} \\
-0 & \text{if draw or ongoing}
+\alpha_{gin} & \text{going gin} \\
+\alpha_{win} & \text{winning by knock} \\
+-\alpha_{win} & \text{losing after knock} \\
+-1.0 & \text{illegal move} \\
+0 & \text{draw or ongoing}
 \end{cases}
 \]
 
-where the scaling factors $\alpha$ differ by model:
+We found that different models perform better with distinct reward scaling. Here's how the parameters vary between implementations:
+
 \begin{table}[h]
 \centering
 \begin{tabular}{lccc}
@@ -37,28 +38,28 @@ $\beta_{deadwood}$ & 0.01 & 0.03 \\
 \end{tabular}
 \end{table}
 
-The shaped rewards use the same structure but with model-specific scaling $\beta$:
+To encourage strategic play throughout the game, we incorporate four types of intermediate rewards:
 
 \begin{enumerate}
-\item Deadwood reduction reward when discarding:
+\item \textbf{Deadwood Reduction:} When discarding, players receive a small reward proportional to the reduction in deadwood:
 \[
 R_{deadwood}(s,s') = \beta_{deadwood} \cdot \max(0, d(s) - d(s'))
 \]
 
-\item Meld formation reward when drawing from discard:
+\item \textbf{Meld Formation:} Drawing from the discard pile to complete a meld earns a small bonus:
 \[
 R_{meld}(s,a,s') = 0.05 \cdot \mathbb{1}_{new\_meld}(s,a,s')
 \]
 
-\item Knock action reward:
+\item \textbf{Knock Incentive:} A moderate reward encourages knocking when appropriate:
 \[
 R_{knock}(a) = \alpha_{knock} \cdot \mathbb{1}_{knock}(a)
 \]
 
-\item Low deadwood winning bonus when knocking:
+\item \textbf{Low Deadwood Bonus:} Winning with minimal deadwood earns extra points:
 \[
 R_{bonus}(s',a) = 0.05 \cdot (10 - d(s')) \cdot \mathbb{1}_{knock\_win}(s',a)
 \]
 \end{enumerate}
 
-This reward structure was designed to balance immediate tactical rewards (reducing deadwood, forming melds) with strategic goals (winning through gin or knock). The higher scaling factors in MCTS encourage more aggressive play compared to DQN and REINFORCE implementations. 
+Notice how MCTS uses higher scaling factors compared to DQN and REINFORCE. This promotes more aggressive play, as MCTS can better evaluate the long-term consequences of bold moves through its tree search. The reward structure balances immediate tactical gains (reducing deadwood, forming melds) with strategic objectives (winning through gin or knock), creating agents that play both tactically and strategically sound Gin Rummy. 

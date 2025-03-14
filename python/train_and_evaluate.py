@@ -6,8 +6,11 @@ import torch
 import random
 import numpy as np
 from tqdm import tqdm
+import matplotlib
+matplotlib.use('TkAgg')  # Use TkAgg backend
 import matplotlib.pyplot as plt
 from typing import List, Dict, Any
+plt.ion()  # Turn on interactive mode
 
 # Import our models and environment
 from dqn import DQNAgent, DQNetwork
@@ -157,6 +160,69 @@ def train_all_models(episodes=1000):
     print("\nTraining with self-play...")
     self_play_training(episodes=episodes)
 
+def print_ascii_plot(values, width=50, height=10, title=""):
+    """Create an ASCII plot of the values."""
+    if not values:
+        return ""
+    
+    # Get min and max values
+    min_val = min(values)
+    max_val = max(values)
+    if min_val == max_val:
+        max_val = min_val + 1  # Prevent division by zero
+    
+    # Create the plot
+    plot = [f"\n{title} {'=' * (width-len(title))}\n"]
+    
+    # Create y-axis labels and plot points
+    for i in range(height-1, -1, -1):
+        # Y-axis label
+        y_val = min_val + (max_val - min_val) * i / (height-1)
+        plot.append(f"{y_val:6.2f} |")
+        
+        # Plot points
+        for j in range(width):
+            if j < len(values):
+                idx = j * len(values) // width  # Sample points evenly
+                val = values[idx]
+                normalized = (val - min_val) / (max_val - min_val)
+                if normalized * (height-1) >= i:
+                    plot.append("█")
+                else:
+                    plot.append(" ")
+        plot.append("\n")
+    
+    # X-axis
+    plot.append("       " + "-" * width + "\n")
+    plot.append("       " + "0" + " " * (width-8) + f"{len(values)-1}\n")
+    
+    return "".join(plot)
+
+def print_progress(metrics: Dict[str, List[float]], episode: int) -> None:
+    """Print training progress with metrics."""
+    # Get recent metrics
+    window = min(100, len(metrics['episode_rewards']))
+    recent_rewards = metrics['episode_rewards'][-window:]
+    recent_policy_losses = metrics['policy_losses'][-window:]
+    recent_value_losses = metrics['value_losses'][-window:]
+    recent_entropy = metrics['entropies'][-window:]
+    
+    # Clear previous line and print current metrics
+    print("\033[K", end="")  # Clear line
+    print(f"\rEpisode {episode}")
+    print(f"Recent Stats (last {window} episodes):")
+    print(f"Reward:       {np.mean(recent_rewards):.3f} (±{np.std(recent_rewards):.3f})")
+    print(f"Policy Loss:  {np.mean(recent_policy_losses):.3f} (±{np.std(recent_policy_losses):.3f})")
+    print(f"Value Loss:   {np.mean(recent_value_losses):.3f} (±{np.std(recent_value_losses):.3f})")
+    print(f"Entropy:      {np.mean(recent_entropy):.3f} (±{np.std(recent_entropy):.3f})")
+    
+    if metrics['eval_rewards']:
+        print(f"Latest Eval:   {metrics['eval_rewards'][-1]:.3f}")
+        print(f"Best Eval:     {max(metrics['eval_rewards']):.3f}")
+    
+    print(f"Best Reward:   {max(metrics['episode_rewards']):.3f}")
+    print("-" * 50)
+
 def train_reinforce(
     env: ImprovedGinRummyEnv,
     agent: REINFORCEAgent,
@@ -178,10 +244,19 @@ def train_reinforce(
     # Create rules-based opponent for evaluation
     eval_opponent = RulesBasedAgent()
     
-    for episode in tqdm(range(num_episodes), desc="Training"):
+    # Disable environment printing
+    env.print_state = lambda: None
+    
+    # Progress bar for episodes
+    progress_bar = tqdm(range(num_episodes), desc="Training Progress")
+    
+    for episode in progress_bar:
         state = env.reset()
         done = False
         episode_reward = 0
+        
+        # Episode progress bar
+        episode_steps = tqdm(total=100, desc="Episode Steps", leave=False)
         
         while not done:
             action = agent.select_action(state)
@@ -198,6 +273,9 @@ def train_reinforce(
             
             state = next_state
             episode_reward += reward
+            episode_steps.update(1)
+        
+        episode_steps.close()
         
         # Train on episode
         losses = agent.train()
@@ -208,6 +286,14 @@ def train_reinforce(
         metrics['value_losses'].append(losses['value_loss'])
         metrics['entropies'].append(losses['entropy'])
         
+        # Update progress bar with current metrics
+        progress_bar.set_postfix({
+            'reward': f"{episode_reward:.2f}",
+            'policy_loss': f"{losses['policy_loss']:.2f}",
+            'value_loss': f"{losses['value_loss']:.2f}",
+            'entropy': f"{losses['entropy']:.2f}"
+        })
+        
         # Evaluate periodically
         if (episode + 1) % eval_interval == 0:
             eval_reward = evaluate_against_rules(agent, eval_opponent, env, num_games=50)
@@ -216,8 +302,8 @@ def train_reinforce(
             # Save model
             agent.save(os.path.join(save_dir, f"reinforce_episode_{episode+1}.pt"))
             
-            # Plot current progress
-            plot_metrics(metrics, episode + 1)
+            # Print progress
+            print_progress(metrics, episode + 1)
     
     return metrics
 
@@ -230,7 +316,11 @@ def evaluate_against_rules(
     """Evaluate agent against rules-based opponent."""
     total_reward = 0
     
-    for _ in range(num_games):
+    # Disable environment printing
+    env.print_state = lambda: None
+    
+    # Progress bar for evaluation games
+    for _ in tqdm(range(num_games), desc="Evaluating", leave=False):
         state = env.reset()
         done = False
         
@@ -248,41 +338,53 @@ def evaluate_against_rules(
     return total_reward / num_games
 
 def plot_metrics(metrics: Dict[str, List[float]], episode: int) -> None:
-    """Plot training metrics."""
-    plt.figure(figsize=(15, 10))
+    """Plot training metrics in real-time."""
+    plt.clf()  # Clear the current figure
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle(f'Training Metrics (Episode {episode})')
     
     # Plot episode rewards
-    plt.subplot(2, 2, 1)
-    plt.plot(metrics['episode_rewards'])
-    plt.title('Episode Rewards')
-    plt.xlabel('Episode')
-    plt.ylabel('Reward')
+    ax1.plot(metrics['episode_rewards'], label='Episode Reward')
+    ax1.set_title('Episode Rewards')
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Reward')
+    ax1.legend()
     
-    # Plot policy loss
-    plt.subplot(2, 2, 2)
-    plt.plot(metrics['policy_losses'])
-    plt.title('Policy Loss')
-    plt.xlabel('Episode')
-    plt.ylabel('Loss')
+    # Plot losses
+    ax2.plot(metrics['policy_losses'], label='Policy Loss', color='red')
+    ax2.plot(metrics['value_losses'], label='Value Loss', color='blue')
+    ax2.set_title('Training Losses')
+    ax2.set_xlabel('Episode')
+    ax2.set_ylabel('Loss')
+    ax2.legend()
     
-    # Plot value loss
-    plt.subplot(2, 2, 3)
-    plt.plot(metrics['value_losses'])
-    plt.title('Value Loss')
-    plt.xlabel('Episode')
-    plt.ylabel('Loss')
+    # Plot entropy
+    ax3.plot(metrics['entropies'], label='Entropy', color='green')
+    ax3.set_title('Policy Entropy')
+    ax3.set_xlabel('Episode')
+    ax3.set_ylabel('Entropy')
+    ax3.legend()
     
     # Plot evaluation rewards
-    plt.subplot(2, 2, 4)
-    eval_episodes = list(range(100, episode + 1, 100))
-    plt.plot(eval_episodes, metrics['eval_rewards'])
-    plt.title('Evaluation Rewards vs Rules-Based')
-    plt.xlabel('Episode')
-    plt.ylabel('Average Reward')
+    eval_episodes = list(range(0, episode + 1, 100))[1:]  # Every 100 episodes
+    if metrics['eval_rewards']:  # Only plot if we have evaluation data
+        ax4.plot(eval_episodes, metrics['eval_rewards'], label='Eval Reward', color='purple')
+        ax4.set_title('Evaluation Rewards')
+        ax4.set_xlabel('Episode')
+        ax4.set_ylabel('Average Reward')
+        ax4.legend()
     
     plt.tight_layout()
-    plt.savefig('training_metrics.png')
-    plt.close()
+    
+    # Create plots directory if it doesn't exist
+    os.makedirs('plots', exist_ok=True)
+    
+    # Save the current plot
+    plt.savefig(f'plots/training_metrics_episode_{episode}.png')
+    
+    # Show the plot
+    plt.show()
+    plt.pause(0.1)  # Small pause to update the plots
 
 def main():
     """Main function"""
@@ -307,6 +409,11 @@ def main():
         env = ImprovedGinRummyEnv()
         agent = REINFORCEAgent()
         
+        # Disable all printing from environment
+        env.print_state = lambda: None
+        env.print_action = lambda x: None
+        env.print_reward = lambda x: None
+        
         # Train agent
         metrics = train_reinforce(
             env=env,
@@ -314,15 +421,17 @@ def main():
             num_episodes=args.episodes,
             eval_interval=100
         )
-        
-        # Plot final metrics
-        plot_metrics(metrics, args.episodes)
     
     if args.evaluate:
         # Create environment and agents
         env = ImprovedGinRummyEnv()
         agent = REINFORCEAgent()
         rules_agent = RulesBasedAgent()
+        
+        # Disable environment printing
+        env.print_state = lambda: None
+        env.print_action = lambda x: None
+        env.print_reward = lambda x: None
         
         # Load latest model if available
         model_files = [f for f in os.listdir('models') if f.startswith('reinforce_episode_')]
