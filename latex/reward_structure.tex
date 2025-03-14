@@ -1,0 +1,64 @@
+% Reward Structure Section for CS229 Project
+
+\subsubsection{Reward Structure}
+
+The reward function is implemented in the environment but with model-specific scaling factors. The base reward structure $R(s,a,s')$ combines terminal rewards with intermediate reward shaping:
+
+\[
+R(s,a,s') = \begin{cases}
+R_{terminal}(s,a,s') & \text{if } \text{reward\_shaping} = \text{False} \\
+R_{terminal}(s,a,s') + R_{shaped}(s,a,s') & \text{otherwise}
+\end{cases}
+\]
+
+The terminal rewards $R_{terminal}$ are defined with model-specific scaling:
+\[
+R_{terminal}(s,a,s') = \begin{cases}
+\alpha_{gin} & \text{if gin} \\
+\alpha_{win} & \text{if knock and win} \\
+-\alpha_{win} & \text{if knock and lose} \\
+-1.0 & \text{if invalid action} \\
+0 & \text{if draw or ongoing}
+\end{cases}
+\]
+
+where the scaling factors $\alpha$ differ by model:
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\hline
+Parameter & DQN/REINFORCE & MCTS \\
+\hline
+$\alpha_{gin}$ & 1.5 & 3.0 \\
+$\alpha_{win}$ & 1.0 & 2.0 \\
+$\alpha_{knock}$ & 0.5 & 1.0 \\
+$\beta_{deadwood}$ & 0.01 & 0.03 \\
+\hline
+\end{tabular}
+\end{table}
+
+The shaped rewards use the same structure but with model-specific scaling $\beta$:
+
+\begin{enumerate}
+\item Deadwood reduction reward when discarding:
+\[
+R_{deadwood}(s,s') = \beta_{deadwood} \cdot \max(0, d(s) - d(s'))
+\]
+
+\item Meld formation reward when drawing from discard:
+\[
+R_{meld}(s,a,s') = 0.05 \cdot \mathbb{1}_{new\_meld}(s,a,s')
+\]
+
+\item Knock action reward:
+\[
+R_{knock}(a) = \alpha_{knock} \cdot \mathbb{1}_{knock}(a)
+\]
+
+\item Low deadwood winning bonus when knocking:
+\[
+R_{bonus}(s',a) = 0.05 \cdot (10 - d(s')) \cdot \mathbb{1}_{knock\_win}(s',a)
+\]
+\end{enumerate}
+
+This reward structure was designed to balance immediate tactical rewards (reducing deadwood, forming melds) with strategic goals (winning through gin or knock). The higher scaling factors in MCTS encourage more aggressive play compared to DQN and REINFORCE implementations. 
