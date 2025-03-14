@@ -1,0 +1,4 @@
+*.pt filter=lfs diff=lfs merge=lfs -text
+python/models/*.pt filter=lfs diff=lfs merge=lfs -text
+models/*.pt filter=lfs diff=lfs merge=lfs -text
+python/fresh_env/** -text 
