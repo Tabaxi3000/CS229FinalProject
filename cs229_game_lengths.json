@@ -1,0 +1,8 @@
+{
+  "game_lengths": {
+    "DQN": 25,
+    "REINFORCE": 25,
+    "MCTS": 23,
+    "IMPROVED_MCTS": 22
+  }
+}
