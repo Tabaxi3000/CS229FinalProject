@@ -107,4 +107,12 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Repository Update
 
-This repository has been updated on March 13, 2024 with the latest code and visualizations. 
+This repository has been updated on March 13, 2024 with the latest code and visualizations.
+
+## GitHub CLI
+
+This repository can be cloned using GitHub CLI with the following command:
+
+```bash
+gh repo clone Tabaxi3000/PrivateCS229
+``` 
