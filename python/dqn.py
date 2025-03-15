@@ -7,186 +7,214 @@ from simple_evaluate import DRAW_STOCK, DRAW_DISCARD, DISCARD, KNOCK, GIN
 from collections import deque, namedtuple
 import random
 from typing import List, Tuple, Dict
-N_SUITS = 4
-N_RANKS = 13
-N_ACTIONS = 110  # 52 discards + 52 draws + 6 special actions
-BATCH_SIZE = 128
-BUFFER_SIZE = 50000
-TARGET_UPDATE = 1000
-GAMMA = 0.99
-Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
-class DQNetwork(nn.Module):
-    """Deep Q-Network for Gin Rummy."""
-    def __init__(self, state_dim=(1, 4, 13), action_dim=110, hidden_dim=128):
-        super(DQNetwork, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
-        self.layer_norm = nn.LayerNorm(64 * 4 * 13)
-        self.lstm = nn.LSTM(52, 128, batch_first=True)
-        self.fc1 = nn.Linear(64 * 4 * 13 + 128, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, action_dim)
-        self.action_bias = nn.Parameter(torch.zeros(1, action_dim))
+
+TOTAL_ACTIONS = 110
+MEMORY_SIZE = 50000
+TRAINING_BATCH = 128
+DISCOUNT = 0.99
+UPDATE_TARGET_EVERY = 1000
+
+GameExperience = namedtuple('GameExperience', ['state', 'action', 'reward', 'next_state', 'done'])
+
+class GinRummyNet(nn.Module):
+    def __init__(self, input_shape=(1, 4, 13), num_actions=110, hidden_size=128):
+        super().__init__()
+        
+        self.card_encoder = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+        
+        self.norm = nn.LayerNorm(64 * 4 * 13)
+        self.history_processor = nn.LSTM(52, 128, batch_first=True)
+        
+        self.decision_maker = nn.Sequential(
+            nn.Linear(64 * 4 * 13 + 128, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, num_actions)
+        )
+        
+        self.action_weights = nn.Parameter(torch.zeros(1, num_actions))
         self.dropout = nn.Dropout(0.2)
-    def forward(self, hand_matrix, discard_history, valid_actions_mask=None):
-        """Forward pass through the network."""
-        x = hand_matrix.float()
-        if x.dim() == 3:  # If [batch, 4, 13]
-            x = x.unsqueeze(1)  # Add channel dim [batch, 1, 4, 13]
-        x = self.conv1(x)
-        x = F.relu(x)
-        x = self.conv2(x)
-        x = F.relu(x)
-        x = self.conv3(x)
-        x = F.relu(x)
-        batch_size = x.size(0)
-        x = x.view(batch_size, -1)
-        x = self.layer_norm(x)
-        discard_history = discard_history.float()
-        if discard_history.dim() == 4:  # If [batch, seq_len, height, width]
-            discard_history = discard_history.view(batch_size, -1, 52)  # Reshape to [batch, seq_len, features]
-        lstm_out, _ = self.lstm(discard_history)
-        lstm_out = lstm_out[:, -1, :]
-        combined = torch.cat([x, lstm_out], dim=1)
-        x = self.fc1(combined)
-        x = F.relu(x)
-        x = self.fc2(x)
-        x = F.relu(x)
-        x = self.fc3(x)
-        q_values = x + self.action_bias
-        if valid_actions_mask is not None:
+        
+    def forward(self, cards, history, action_mask=None):
+        batch = cards.size(0)
+        
+        if cards.dim() == 3:
+            cards = cards.unsqueeze(1)
+            
+        encoded_cards = self.card_encoder(cards.float())
+        flattened = encoded_cards.view(batch, -1)
+        normalized = self.norm(flattened)
+        
+        history = history.float()
+        if history.dim() == 4:
+            history = history.view(batch, -1, 52)
+            
+        lstm_output, _ = self.history_processor(history)
+        last_hidden = lstm_output[:, -1, :]
+        
+        features = torch.cat([normalized, last_hidden], dim=1)
+        
+        for layer in self.decision_maker:
+            features = layer(features)
+            if isinstance(layer, nn.Linear):
+                features = self.dropout(features)
+                
+        q_values = features + self.action_weights
+        
+        if action_mask is not None:
             q_values = q_values.clone()
-            if valid_actions_mask.dim() == 1 and q_values.dim() > 1:
-                valid_actions_mask = valid_actions_mask.unsqueeze(0)
-                if valid_actions_mask.size(1) != q_values.size(1):
+            if action_mask.dim() == 1 and q_values.dim() > 1:
+                action_mask = action_mask.unsqueeze(0)
+                if action_mask.size(1) != q_values.size(1):
                     return q_values
-                valid_actions_mask = valid_actions_mask.expand_as(q_values)
-            q_values[~valid_actions_mask.bool()] = float('-inf')
+                action_mask = action_mask.expand_as(q_values)
+            q_values[~action_mask.bool()] = float('-inf')
+            
         return q_values
-    def load(self, filepath):
-        """Load model checkpoint from file."""
-        checkpoint = torch.load(filepath, map_location=self.device)
-        self.policy_net.load_state_dict(checkpoint['policy_state_dict'])
-        self.target_net.load_state_dict(checkpoint['target_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.steps_done = checkpoint['steps_done']
-class ReplayBuffer:
-    def __init__(self, buffer_size: int):
-        self.buffer = deque(maxlen=buffer_size)
-    def push(self, *, state: Dict[str, torch.Tensor], action: int, reward: float, next_state: Dict[str, torch.Tensor], done: bool):
-        """Add experience to buffer using named arguments."""
-        experience = Experience(state=state, action=action, reward=reward, next_state=next_state, done=done)
-        self.buffer.append(experience)
-    def sample(self, batch_size: int) -> List[Experience]:
-        """Sample random batch of experiences."""
-        return random.sample(self.buffer, batch_size)
-    def __len__(self) -> int:
-        return len(self.buffer)
-class DQNAgent:
-    """DQN agent for Gin Rummy."""
-    def __init__(self, state_dim=(1, 4, 13), action_dim=110, hidden_dim=128):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+
+class ExperienceBuffer:
+    def __init__(self, max_size):
+        self.memory = deque(maxlen=max_size)
+        
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append(GameExperience(state, action, reward, next_state, done))
+        
+    def get_batch(self, size):
+        return random.sample(self.memory, size)
+        
+    def __len__(self):
+        return len(self.memory)
+
+class GinRummyAgent:
+    def __init__(self, input_shape=(1, 4, 13), num_actions=110, hidden_size=128):
+        if torch.backends.mps.is_available():
             self.device = torch.device("mps")
-        self.model = DQNetwork(state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim).to(self.device)
-        self.target_model = DQNetwork(state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim).to(self.device)
-        self.target_model.load_state_dict(self.model.state_dict())
-        self.target_model.eval()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001)
-        self.memory = ReplayBuffer(BUFFER_SIZE)
-        self.steps_done = 0
-        self.current_loss = None
-    def select_action(self, state, epsilon=0.1):
-        """Select an action using epsilon-greedy policy."""
-        if random.random() < epsilon:
-            valid_actions = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
-            if isinstance(valid_actions, int):
-                valid_actions = [valid_actions]
-            return random.choice(valid_actions)
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+            
+        self.brain = GinRummyNet(input_shape, num_actions, hidden_size).to(self.device)
+        self.target_brain = GinRummyNet(input_shape, num_actions, hidden_size).to(self.device)
+        self.target_brain.load_state_dict(self.brain.state_dict())
+        
+        self.memory = ExperienceBuffer(MEMORY_SIZE)
+        self.optimizer = optim.Adam(self.brain.parameters(), lr=0.0001)
+        
+        self.exploration_rate = 1.0
+        self.min_exploration = 0.01
+        self.exploration_decay = 0.995
+        
+        self.training_steps = 0
+        self.last_loss = None
+        
+    def choose_action(self, game_state, explore=True):
+        if explore and random.random() < self.exploration_rate:
+            valid_moves = torch.nonzero(game_state['valid_actions_mask']).squeeze().tolist()
+            if isinstance(valid_moves, int):
+                valid_moves = [valid_moves]
+            return random.choice(valid_moves)
+            
         with torch.no_grad():
-            state_device = {
-                'hand_matrix': state['hand_matrix'].unsqueeze(0).to(self.device),
-                'discard_history': state['discard_history'].unsqueeze(0).to(self.device),
-                'valid_actions_mask': state['valid_actions_mask'].unsqueeze(0).to(self.device)
+            state_tensor = {
+                'hand_matrix': game_state['hand_matrix'].unsqueeze(0).to(self.device),
+                'discard_history': game_state['discard_history'].unsqueeze(0).to(self.device),
+                'valid_actions_mask': game_state['valid_actions_mask'].unsqueeze(0).to(self.device)
             }
-            q_values = self.model(
-                state_device['hand_matrix'],
-                state_device['discard_history'],
-                state_device['valid_actions_mask']
+            
+            q_values = self.brain(
+                state_tensor['hand_matrix'],
+                state_tensor['discard_history'],
+                state_tensor['valid_actions_mask']
             )
-            masked_q_values = q_values.clone()
-            masked_q_values[~state_device['valid_actions_mask'].bool()] = float('-inf')
-            return masked_q_values.squeeze(0).argmax().item()
-    def optimize_model(self):
-        """Perform one step of optimization."""
-        if len(self.memory) < BATCH_SIZE:
+            
+            masked_values = q_values.clone()
+            masked_values[~state_tensor['valid_actions_mask'].bool()] = float('-inf')
+            
+            return masked_values.squeeze(0).argmax().item()
+            
+    def learn(self):
+        if len(self.memory) < TRAINING_BATCH:
             return
-        experiences = self.memory.sample(BATCH_SIZE)
-        batch = Experience(*zip(*experiences))
+            
+        experiences = self.memory.get_batch(TRAINING_BATCH)
+        batch = GameExperience(*zip(*experiences))
+        
         state_batch = {
             'hand_matrix': torch.cat([s['hand_matrix'] for s in batch.state]).to(self.device),
             'discard_history': torch.cat([s['discard_history'] for s in batch.state]).to(self.device),
             'valid_actions_mask': torch.stack([s['valid_actions_mask'] for s in batch.state]).to(self.device)
         }
-        next_state_batch = {
+        
+        next_states = {
             'hand_matrix': torch.cat([s['hand_matrix'] for s in batch.next_state]).to(self.device),
             'discard_history': torch.cat([s['discard_history'] for s in batch.next_state]).to(self.device),
             'valid_actions_mask': torch.stack([s['valid_actions_mask'] for s in batch.next_state]).to(self.device)
         }
-        action_batch = torch.tensor(batch.action, device=self.device).unsqueeze(1)
-        reward_batch = torch.tensor(batch.reward, device=self.device, dtype=torch.float32)
-        done_batch = torch.tensor(batch.done, device=self.device, dtype=torch.float32)
-        state_action_values = self.model(
+        
+        actions = torch.tensor(batch.action, device=self.device).unsqueeze(1)
+        rewards = torch.tensor(batch.reward, device=self.device, dtype=torch.float32)
+        done_flags = torch.tensor(batch.done, device=self.device, dtype=torch.float32)
+        
+        current_q = self.brain(
             state_batch['hand_matrix'],
             state_batch['discard_history'],
             state_batch['valid_actions_mask']
-        ).gather(1, action_batch)
+        ).gather(1, actions)
+        
         with torch.no_grad():
-            next_q_values = self.target_model(
-                next_state_batch['hand_matrix'],
-                next_state_batch['discard_history'],
-                next_state_batch['valid_actions_mask']
+            next_q = self.target_brain(
+                next_states['hand_matrix'],
+                next_states['discard_history'],
+                next_states['valid_actions_mask']
             )
-            next_q_values = next_q_values.clone()
-            next_q_values[~next_state_batch['valid_actions_mask'].bool()] = float('-inf')
-            next_state_values = next_q_values.max(1)[0].detach()
-            next_state_values = next_state_values * (1 - done_batch)
-            expected_state_action_values = reward_batch + (GAMMA * next_state_values)
-        reward_mean = reward_batch.mean()
-        reward_std = reward_batch.std() + 1e-6
-        normalized_rewards = (reward_batch - reward_mean) / reward_std
-        loss = F.smooth_l1_loss(
-            state_action_values,
-            expected_state_action_values.unsqueeze(1)
-        )
-        self.current_loss = loss.item()
+            
+            next_q = next_q.clone()
+            next_q[~next_states['valid_actions_mask'].bool()] = float('-inf')
+            max_next_q = next_q.max(1)[0].detach()
+            max_next_q = max_next_q * (1 - done_flags)
+            
+            target_q = rewards + (DISCOUNT * max_next_q)
+            
+        loss = F.smooth_l1_loss(current_q, target_q.unsqueeze(1))
+        self.last_loss = loss.item()
+        
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.brain.parameters(), 1.0)
         self.optimizer.step()
-        if self.steps_done % TARGET_UPDATE == 0:
-            self.target_model.load_state_dict(self.model.state_dict())
-        self.steps_done += 1
-        return self.current_loss
-    def save(self, filepath):
-        """Save model checkpoint to file."""
+        
+        if self.exploration_rate > self.min_exploration:
+            self.exploration_rate *= self.exploration_decay
+            
+        if self.training_steps % UPDATE_TARGET_EVERY == 0:
+            self.target_brain.load_state_dict(self.brain.state_dict())
+            
+        self.training_steps += 1
+        return self.last_loss
+        
+    def save_checkpoint(self, filepath):
         checkpoint = {
-            'policy_state_dict': self.model.state_dict(),
-            'target_state_dict': self.target_model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'steps_done': self.steps_done
+            'model_state': self.brain.state_dict(),
+            'target_model_state': self.target_brain.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'training_steps': self.training_steps,
+            'exploration_rate': self.exploration_rate
         }
         torch.save(checkpoint, filepath)
-    def load(self, filepath):
-        """Load model checkpoint from file."""
+        
+    def load_checkpoint(self, filepath):
         checkpoint = torch.load(filepath, map_location=self.device)
-        self.model.load_state_dict(checkpoint['policy_state_dict'])
-        self.target_model.load_state_dict(checkpoint['target_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.steps_done = checkpoint['steps_done']
-    def load_model(self, path):
-        """Load model from path."""
-        self.model.load_state_dict(torch.load(path, map_location=self.device))
-        self.target_model.load_state_dict(torch.load(path, map_location=self.device))
-        self.target_model.eval() 
+        self.brain.load_state_dict(checkpoint['model_state'])
+        self.target_brain.load_state_dict(checkpoint['target_model_state'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        self.training_steps = checkpoint['training_steps']
+        self.exploration_rate = checkpoint['exploration_rate'] 
