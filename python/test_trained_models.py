@@ -7,6 +7,8 @@ from reinforce import PolicyNetwork
 from mcts import PolicyValueNetwork
 from simple_evaluate import GinRummyEnv, RandomAgent
 from tqdm import tqdm
+from improved_gin_rummy_env import GinRummy
+from rules_based_agent import RulesAgent
 
 def create_state_tensor(state):
     """Create state tensor from state dictionary."""
@@ -46,6 +48,8 @@ class ModelWrapper:
                 value_path = model_path
                 self.model.load_models(policy_path, value_path, self.device)
             self.model.eval()
+        elif model_type == 'rules':
+            self.model = RulesAgent()
     
     def select_action(self, state):
         """Select action based on model type."""

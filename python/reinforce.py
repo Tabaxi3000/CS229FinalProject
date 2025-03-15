@@ -5,46 +5,43 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
-from typing import List, Tuple, Dict, Optional
 from collections import namedtuple
 from simple_evaluate import DRAW_STOCK, DRAW_DISCARD, DISCARD, KNOCK, GIN
 from torch.distributions import Categorical
 
-TOTAL_ACTIONS = 110
-DISCOUNT = 0.99
-ENTROPY_WEIGHT = 0.01
+N_ACTIONS = 110
+GAMMA = 0.99
+ENTROPY_BETA = 0.01
 
-GameStep = namedtuple('GameStep', ['state', 'action', 'reward', 'next_state', 'done'])
+Step = namedtuple('Step', ['state', 'action', 'reward', 'next_state', 'done'])
 
-class MemoryCell(nn.Module):
-    def __init__(self, input_dim, hidden_dim):
+class LSTM(nn.Module):
+    def __init__(self, in_dim, hidden_dim):
         super().__init__()
-        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         
-        self.input_weights = nn.Parameter(torch.Tensor(hidden_dim, input_dim))
-        self.hidden_weights = nn.Parameter(torch.Tensor(hidden_dim, hidden_dim // 4))
-        self.input_bias = nn.Parameter(torch.Tensor(hidden_dim))
-        self.hidden_bias = nn.Parameter(torch.Tensor(hidden_dim))
+        self.wx = nn.Parameter(torch.Tensor(hidden_dim, in_dim))
+        self.wh = nn.Parameter(torch.Tensor(hidden_dim, hidden_dim // 4))
+        self.bx = nn.Parameter(torch.Tensor(hidden_dim))
+        self.bh = nn.Parameter(torch.Tensor(hidden_dim))
         
-        self.reset_weights()
+        self.reset()
         
-    def reset_weights(self):
-        for param in self.parameters():
-            nn.init.uniform_(param, -0.1, 0.1)
+    def reset(self):
+        nn.init.uniform_(self.wx, -0.1, 0.1)
+        nn.init.uniform_(self.wh, -0.1, 0.1)
+        nn.init.zeros_(self.bx)
+        nn.init.zeros_(self.bh)
             
-    def forward(self, inputs):
-        batch_size, seq_len, _ = inputs.size()
+    def forward(self, x):
+        batch, seq_len, _ = x.size()
+        h = torch.zeros(batch, self.hidden_dim // 4, device=x.device)
+        c = torch.zeros(batch, self.hidden_dim // 4, device=x.device)
         
-        hidden = torch.zeros(batch_size, self.hidden_dim // 4, device=inputs.device)
-        cell = torch.zeros(batch_size, self.hidden_dim // 4, device=inputs.device)
-        
-        outputs = []
+        out = []
         for t in range(seq_len):
-            x = inputs[:, t, :]
-            
-            gates = torch.matmul(x, self.input_weights.t()) + self.input_bias
-            gates += torch.matmul(hidden, self.hidden_weights.t()) + self.hidden_bias
+            gates = x[:, t] @ self.wx.t() + self.bx
+            gates = gates + h @ self.wh.t() + self.bh
             
             i, f, g, o = gates.chunk(4, dim=1)
             
@@ -53,123 +50,113 @@ class MemoryCell(nn.Module):
             g = torch.tanh(g)
             o = torch.sigmoid(o)
             
-            cell = f * cell + i * g
-            hidden = o * torch.tanh(cell)
+            c = f * c + i * g
+            h = o * torch.tanh(c)
             
-            outputs.append(hidden)
+            out.append(h)
             
-        return torch.stack(outputs, dim=1), (hidden, cell)
+        return torch.stack(out, dim=1), (h, c)
 
-class GinRummyNet(nn.Module):
-    def __init__(self, num_actions=110):
+class Net(nn.Module):
+    def __init__(self, n_actions=110):
         super().__init__()
         
-        self.card_encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU()
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Dropout(0.2)
         )
         
-        self.history_processor = nn.LSTM(52, 128, batch_first=True)
+        self.lstm = nn.LSTM(52, 128, batch_first=True)
         
-        self.decision_maker = nn.Sequential(
+        self.fc = nn.Sequential(
             nn.Linear(64 * 4 * 13 + 128, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU()
         )
         
-        self.move_predictor = nn.Linear(128, num_actions)
-        self.value_estimator = nn.Linear(128, 1)
+        self.policy = nn.Linear(128, n_actions)
+        self.value = nn.Linear(128, 1)
         
-        self.apply(self._init_network)
+        self.apply(self._init)
         
-    def _init_network(self, layer):
-        if isinstance(layer, nn.Linear):
-            nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
-            nn.init.zeros_(layer.bias)
+    def _init(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+            nn.init.zeros_(m.bias)
             
     def forward(self, cards, history):
-        batch_size = cards.size(0)
+        batch = cards.size(0)
         
         if cards.dim() == 3:
             cards = cards.unsqueeze(1)
             
-        encoded_cards = self.card_encoder(cards.float())
-        flattened_cards = encoded_cards.view(batch_size, -1)
+        x = self.conv(cards.float())
+        x = x.view(batch, -1)
         
-        history_features, _ = self.history_processor(history.float())
-        last_state = history_features[:, -1, :]
+        h, _ = self.lstm(history.float())
+        h = h[:, -1]
         
-        features = torch.cat([flattened_cards, last_state], dim=1)
-        
-        for layer in self.decision_maker:
-            features = layer(features)
+        x = torch.cat([x, h], dim=1)
+        x = self.fc(x)
             
-        move_probs = F.softmax(self.move_predictor(features), dim=1)
-        state_value = self.value_estimator(features)
+        pi = F.softmax(self.policy(x), dim=1)
+        v = self.value(x)
         
-        return move_probs, state_value
+        return pi, v
 
-class GinRummyAgent:
-    def __init__(self, network=None, learning_rate=0.0003):
-        if torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
+class Agent:
+    def __init__(self, net=None, lr=3e-4):
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else
+                                 "cuda" if torch.cuda.is_available() else "cpu")
             
-        self.network = network if network else GinRummyNet()
-        self.network.to(self.device)
+        self.net = net if net else Net()
+        self.net.to(self.device)
         
-        self.optimizer = optim.Adam(self.network.parameters(), lr=learning_rate, eps=1e-5)
+        self.optim = optim.Adam(self.net.parameters(), lr=lr, eps=1e-5)
         self.memory = []
         
-        self.discount = DISCOUNT
-        self.entropy_weight = 0.001
+        self.gamma = GAMMA
+        self.beta = ENTROPY_BETA
         self.max_grad = 0.5
         self.value_weight = 0.25
         
-    def choose_action(self, game_state, explore=True):
+    def act(self, state, explore=True):
         with torch.no_grad():
-            state_tensor = {
-                'hand_matrix': game_state['hand_matrix'].to(self.device),
-                'discard_history': game_state['discard_history'].to(self.device),
-                'valid_actions_mask': game_state['valid_actions_mask'].to(self.device)
-            }
+            state = {k: v.to(self.device) for k, v in state.items()}
             
-            move_probs, _ = self.network(state_tensor['hand_matrix'], state_tensor['discard_history'])
-            move_probs = move_probs.squeeze()
+            pi, _ = self.net(state['hand_matrix'], state['discard_history'])
+            pi = pi.squeeze()
             
-            legal_moves = state_tensor['valid_actions_mask']
-            move_probs = move_probs * legal_moves
-            move_probs = move_probs / (move_probs.sum() + 1e-10)
+            mask = state['valid_actions_mask']
+            pi = pi * mask
+            pi = pi / (pi.sum() + 1e-10)
             
-            temperature = 0.5 if not explore else 1.0
-            move_probs = F.softmax(torch.log(move_probs + 1e-10) / temperature, dim=-1)
+            temp = 0.5 if not explore else 1.0
+            pi = F.softmax(torch.log(pi + 1e-10) / temp, dim=-1)
             
             if not explore:
-                return torch.argmax(move_probs).item()
+                return torch.argmax(pi).item()
                 
             try:
-                distribution = Categorical(move_probs)
-                return distribution.sample().item()
+                dist = Categorical(pi)
+                return dist.sample().item()
             except:
-                return torch.argmax(move_probs).item()
+                return torch.argmax(pi).item()
                 
-    def remember(self, state, action, reward, next_state, done):
-        experience = GameStep(state=state, action=action, reward=reward, next_state=next_state, done=done)
-        self.memory.append(experience)
+    def store(self, state, action, reward, next_state, done):
+        self.memory.append(Step(state, action, reward, next_state, done))
         
-    def compute_returns(self, rewards):
+    def get_returns(self, rewards):
         returns = []
-        future_return = 0
+        R = 0
         
         for r in reversed(rewards):
-            future_return = r + self.discount * future_return
-            returns.insert(0, future_return)
+            R = r + self.gamma * R
+            returns.insert(0, R)
             
         returns = torch.tensor(returns, device=self.device)
         
@@ -182,60 +169,60 @@ class GinRummyAgent:
         if not self.memory:
             return {'policy_loss': 0, 'value_loss': 0, 'entropy': 0}
             
-        states = [step.state for step in self.memory]
-        actions = torch.tensor([step.action for step in self.memory], device=self.device)
-        rewards = [step.reward for step in self.memory]
+        states = [s.state for s in self.memory]
+        actions = torch.tensor([s.action for s in self.memory], device=self.device)
+        rewards = [s.reward for s in self.memory]
         
-        returns = self.compute_returns(rewards)
+        returns = self.get_returns(rewards)
         
-        policy_loss = torch.tensor(0.0, device=self.device)
-        value_loss = torch.tensor(0.0, device=self.device)
-        entropy_loss = torch.tensor(0.0, device=self.device)
+        policy_loss = 0
+        value_loss = 0
+        entropy_loss = 0
         
-        state_values = []
-        for state in states:
-            _, value = self.network(state['hand_matrix'].to(self.device), 
-                                  state['discard_history'].to(self.device))
-            state_values.append(value)
+        values = []
+        for s in states:
+            _, v = self.net(s['hand_matrix'].to(self.device), 
+                           s['discard_history'].to(self.device))
+            values.append(v)
             
-        state_values = torch.cat(state_values)
-        advantages = returns - state_values.detach()
+        values = torch.cat(values)
+        advantages = returns - values.detach()
         
         if len(advantages) > 1:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             
-        batch_size = len(states)
-        for t, (state, action, advantage, ret) in enumerate(zip(states, actions, advantages, returns)):
-            move_probs, value = self.network(state['hand_matrix'].to(self.device),
-                                           state['discard_history'].to(self.device))
-                                           
-            legal_moves = state['valid_actions_mask'].to(self.device)
-            move_probs = move_probs.squeeze() * legal_moves
-            move_probs = move_probs / (move_probs.sum() + 1e-10)
+        batch = len(states)
+        for t, (s, a, adv, ret) in enumerate(zip(states, actions, advantages, returns)):
+            pi, v = self.net(s['hand_matrix'].to(self.device),
+                            s['discard_history'].to(self.device))
+                            
+            mask = s['valid_actions_mask'].to(self.device)
+            pi = pi.squeeze() * mask
+            pi = pi / (pi.sum() + 1e-10)
             
-            log_prob = torch.log(move_probs[action] + 1e-10)
-            policy_loss += -log_prob * advantage.detach()
+            log_pi = torch.log(pi[a] + 1e-10)
+            policy_loss += -log_pi * adv.detach()
             
-            value_loss += F.mse_loss(value.squeeze(), ret.unsqueeze(0))
+            value_loss += F.mse_loss(v.squeeze(), ret)
             
-            entropy = -(move_probs * torch.log(move_probs + 1e-10)).sum()
+            entropy = -(pi * torch.log(pi + 1e-10)).sum()
             entropy = torch.clamp(entropy, -2.0, 2.0)
             entropy_loss += entropy
             
-        policy_loss /= batch_size
-        value_loss /= batch_size
-        entropy_loss /= batch_size
+        policy_loss /= batch
+        value_loss /= batch
+        entropy_loss /= batch
         
-        total_loss = (
+        loss = (
             policy_loss +
             self.value_weight * value_loss -
-            self.entropy_weight * entropy_loss
+            self.beta * entropy_loss
         )
         
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad)
-        self.optimizer.step()
+        self.optim.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad)
+        self.optim.step()
         
         self.memory.clear()
         
@@ -245,12 +232,12 @@ class GinRummyAgent:
             'entropy': entropy_loss.item()
         }
         
-    def save_model(self, path):
-        torch.save(self.network.state_dict(), path)
+    def save(self, path):
+        torch.save(self.net.state_dict(), path)
         
-    def load_model(self, path):
-        self.network.load_state_dict(torch.load(path, map_location=self.device))
-        self.network.eval()
+    def load(self, path):
+        self.net.load_state_dict(torch.load(path, map_location=self.device))
+        self.net.eval()
 
     def _find_melds(self, hand_matrix: torch.Tensor) -> List[List[int]]:
         """Find all valid melds in the hand."""
@@ -329,7 +316,7 @@ class GinRummyAgent:
 
     def update(self, state_batch, action_batch, reward_batch):
         """Update policy network using policy gradient."""
-        probs = self.network(state_batch)
+        probs = self.net(state_batch)
         eps = 1e-10
         probs = probs.clamp(min=eps, max=1.0 - eps)
         log_probs = torch.log(probs)
@@ -339,10 +326,10 @@ class GinRummyAgent:
         entropy = -(probs * log_probs).sum(dim=1).mean()
         entropy = torch.clamp(entropy, min=-2.0, max=2.0)  # Prevent extreme entropy values
         loss = policy_loss - self.entropy_coef * entropy
-        self.optimizer.zero_grad()
+        self.optim.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
-        self.optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
+        self.optim.step()
         return loss.item()
 
     def calculate_deadwood_and_melds(self, hand):

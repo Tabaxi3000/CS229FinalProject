@@ -6,155 +6,129 @@ import numpy as np
 from simple_evaluate import DRAW_STOCK, DRAW_DISCARD, DISCARD, KNOCK, GIN
 from collections import deque, namedtuple
 import random
-from typing import List, Tuple, Dict
 
-TOTAL_ACTIONS = 110
-MEMORY_SIZE = 50000
-TRAINING_BATCH = 128
-DISCOUNT = 0.99
-UPDATE_TARGET_EVERY = 1000
+N_ACTIONS = 110
+BUFFER_SIZE = 50000
+BATCH_SIZE = 128
+GAMMA = 0.99
+TARGET_UPDATE = 1000
 
-GameExperience = namedtuple('GameExperience', ['state', 'action', 'reward', 'next_state', 'done'])
+Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state', 'done'])
 
-class GinRummyNet(nn.Module):
-    def __init__(self, input_shape=(1, 4, 13), num_actions=110, hidden_size=128):
+class DQN(nn.Module):
+    def __init__(self, input_shape=(1, 4, 13), hidden_size=128):
         super().__init__()
         
-        self.card_encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.Conv2d(32, 64, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.ReLU()
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Dropout(0.2)
         )
         
         self.norm = nn.LayerNorm(64 * 4 * 13)
-        self.history_processor = nn.LSTM(52, 128, batch_first=True)
+        self.lstm = nn.LSTM(52, 128, batch_first=True)
         
-        self.decision_maker = nn.Sequential(
+        self.head = nn.Sequential(
             nn.Linear(64 * 4 * 13 + 128, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
-            nn.Linear(hidden_size, num_actions)
+            nn.Linear(hidden_size, N_ACTIONS)
         )
         
-        self.action_weights = nn.Parameter(torch.zeros(1, num_actions))
-        self.dropout = nn.Dropout(0.2)
+        self.action_bias = nn.Parameter(torch.zeros(1, N_ACTIONS))
         
-    def forward(self, cards, history, action_mask=None):
+    def forward(self, cards, history, mask=None):
         batch = cards.size(0)
         
         if cards.dim() == 3:
             cards = cards.unsqueeze(1)
             
-        encoded_cards = self.card_encoder(cards.float())
-        flattened = encoded_cards.view(batch, -1)
-        normalized = self.norm(flattened)
+        x = self.conv(cards.float())
+        x = x.view(batch, -1)
+        x = self.norm(x)
         
         history = history.float()
         if history.dim() == 4:
             history = history.view(batch, -1, 52)
             
-        lstm_output, _ = self.history_processor(history)
-        last_hidden = lstm_output[:, -1, :]
+        lstm_out, _ = self.lstm(history)
+        lstm_out = lstm_out[:, -1]
         
-        features = torch.cat([normalized, last_hidden], dim=1)
+        x = torch.cat([x, lstm_out], dim=1)
+        x = self.head(x) + self.action_bias
         
-        for layer in self.decision_maker:
-            features = layer(features)
-            if isinstance(layer, nn.Linear):
-                features = self.dropout(features)
-                
-        q_values = features + self.action_weights
-        
-        if action_mask is not None:
-            q_values = q_values.clone()
-            if action_mask.dim() == 1 and q_values.dim() > 1:
-                action_mask = action_mask.unsqueeze(0)
-                if action_mask.size(1) != q_values.size(1):
-                    return q_values
-                action_mask = action_mask.expand_as(q_values)
-            q_values[~action_mask.bool()] = float('-inf')
+        if mask is not None:
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            x[~mask.bool()] = float('-inf')
             
-        return q_values
+        return x
 
-class ExperienceBuffer:
-    def __init__(self, max_size):
-        self.memory = deque(maxlen=max_size)
+class ReplayBuffer:
+    def __init__(self, size):
+        self.buffer = deque(maxlen=size)
         
-    def remember(self, state, action, reward, next_state, done):
-        self.memory.append(GameExperience(state, action, reward, next_state, done))
+    def add(self, state, action, reward, next_state, done):
+        self.buffer.append(Experience(state, action, reward, next_state, done))
         
-    def get_batch(self, size):
-        return random.sample(self.memory, size)
+    def sample(self, size):
+        return random.sample(self.buffer, size)
         
     def __len__(self):
-        return len(self.memory)
+        return len(self.buffer)
 
-class GinRummyAgent:
-    def __init__(self, input_shape=(1, 4, 13), num_actions=110, hidden_size=128):
-        if torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
+class Agent:
+    def __init__(self, input_shape=(1, 4, 13), hidden_size=128):
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else
+                                 "cuda" if torch.cuda.is_available() else "cpu")
             
-        self.brain = GinRummyNet(input_shape, num_actions, hidden_size).to(self.device)
-        self.target_brain = GinRummyNet(input_shape, num_actions, hidden_size).to(self.device)
-        self.target_brain.load_state_dict(self.brain.state_dict())
+        self.q_net = DQN(input_shape, hidden_size).to(self.device)
+        self.target_net = DQN(input_shape, hidden_size).to(self.device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
         
-        self.memory = ExperienceBuffer(MEMORY_SIZE)
-        self.optimizer = optim.Adam(self.brain.parameters(), lr=0.0001)
+        self.memory = ReplayBuffer(BUFFER_SIZE)
+        self.optim = optim.Adam(self.q_net.parameters(), lr=1e-4)
         
-        self.exploration_rate = 1.0
-        self.min_exploration = 0.01
-        self.exploration_decay = 0.995
+        self.eps = 1.0
+        self.eps_min = 0.01
+        self.eps_decay = 0.995
         
-        self.training_steps = 0
+        self.steps = 0
         self.last_loss = None
         
-    def choose_action(self, game_state, explore=True):
-        if explore and random.random() < self.exploration_rate:
-            valid_moves = torch.nonzero(game_state['valid_actions_mask']).squeeze().tolist()
-            if isinstance(valid_moves, int):
-                valid_moves = [valid_moves]
-            return random.choice(valid_moves)
+    def act(self, state, explore=True):
+        if explore and random.random() < self.eps:
+            valid = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
+            if isinstance(valid, int):
+                valid = [valid]
+            return random.choice(valid)
             
         with torch.no_grad():
-            state_tensor = {
-                'hand_matrix': game_state['hand_matrix'].unsqueeze(0).to(self.device),
-                'discard_history': game_state['discard_history'].unsqueeze(0).to(self.device),
-                'valid_actions_mask': game_state['valid_actions_mask'].unsqueeze(0).to(self.device)
-            }
-            
-            q_values = self.brain(
-                state_tensor['hand_matrix'],
-                state_tensor['discard_history'],
-                state_tensor['valid_actions_mask']
-            )
-            
-            masked_values = q_values.clone()
-            masked_values[~state_tensor['valid_actions_mask'].bool()] = float('-inf')
-            
-            return masked_values.squeeze(0).argmax().item()
+            state = {k: v.unsqueeze(0).to(self.device) for k, v in state.items()}
+            q_vals = self.q_net(state['hand_matrix'], 
+                              state['discard_history'],
+                              state['valid_actions_mask'])
+            return q_vals.squeeze(0).argmax().item()
             
     def learn(self):
-        if len(self.memory) < TRAINING_BATCH:
+        if len(self.memory) < BATCH_SIZE:
             return
             
-        experiences = self.memory.get_batch(TRAINING_BATCH)
-        batch = GameExperience(*zip(*experiences))
+        batch = self.memory.sample(BATCH_SIZE)
+        batch = Experience(*zip(*batch))
         
-        state_batch = {
+        state = {
             'hand_matrix': torch.cat([s['hand_matrix'] for s in batch.state]).to(self.device),
             'discard_history': torch.cat([s['discard_history'] for s in batch.state]).to(self.device),
             'valid_actions_mask': torch.stack([s['valid_actions_mask'] for s in batch.state]).to(self.device)
         }
         
-        next_states = {
+        next_state = {
             'hand_matrix': torch.cat([s['hand_matrix'] for s in batch.next_state]).to(self.device),
             'discard_history': torch.cat([s['discard_history'] for s in batch.next_state]).to(self.device),
             'valid_actions_mask': torch.stack([s['valid_actions_mask'] for s in batch.next_state]).to(self.device)
@@ -162,59 +136,50 @@ class GinRummyAgent:
         
         actions = torch.tensor(batch.action, device=self.device).unsqueeze(1)
         rewards = torch.tensor(batch.reward, device=self.device, dtype=torch.float32)
-        done_flags = torch.tensor(batch.done, device=self.device, dtype=torch.float32)
+        done = torch.tensor(batch.done, device=self.device, dtype=torch.float32)
         
-        current_q = self.brain(
-            state_batch['hand_matrix'],
-            state_batch['discard_history'],
-            state_batch['valid_actions_mask']
-        ).gather(1, actions)
+        q_vals = self.q_net(state['hand_matrix'],
+                           state['discard_history'],
+                           state['valid_actions_mask']).gather(1, actions)
         
         with torch.no_grad():
-            next_q = self.target_brain(
-                next_states['hand_matrix'],
-                next_states['discard_history'],
-                next_states['valid_actions_mask']
-            )
+            next_q = self.target_net(next_state['hand_matrix'],
+                                   next_state['discard_history'],
+                                   next_state['valid_actions_mask'])
+            next_q[~next_state['valid_actions_mask'].bool()] = float('-inf')
+            next_q = next_q.max(1)[0] * (1 - done)
+            target = rewards + GAMMA * next_q
             
-            next_q = next_q.clone()
-            next_q[~next_states['valid_actions_mask'].bool()] = float('-inf')
-            max_next_q = next_q.max(1)[0].detach()
-            max_next_q = max_next_q * (1 - done_flags)
-            
-            target_q = rewards + (DISCOUNT * max_next_q)
-            
-        loss = F.smooth_l1_loss(current_q, target_q.unsqueeze(1))
+        loss = F.smooth_l1_loss(q_vals, target.unsqueeze(1))
         self.last_loss = loss.item()
         
-        self.optimizer.zero_grad()
+        self.optim.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.brain.parameters(), 1.0)
-        self.optimizer.step()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 1.0)
+        self.optim.step()
         
-        if self.exploration_rate > self.min_exploration:
-            self.exploration_rate *= self.exploration_decay
+        if self.eps > self.eps_min:
+            self.eps *= self.eps_decay
             
-        if self.training_steps % UPDATE_TARGET_EVERY == 0:
-            self.target_brain.load_state_dict(self.brain.state_dict())
+        if self.steps % TARGET_UPDATE == 0:
+            self.target_net.load_state_dict(self.q_net.state_dict())
             
-        self.training_steps += 1
+        self.steps += 1
         return self.last_loss
         
-    def save_checkpoint(self, filepath):
-        checkpoint = {
-            'model_state': self.brain.state_dict(),
-            'target_model_state': self.target_brain.state_dict(),
-            'optimizer_state': self.optimizer.state_dict(),
-            'training_steps': self.training_steps,
-            'exploration_rate': self.exploration_rate
-        }
-        torch.save(checkpoint, filepath)
+    def save(self, path):
+        torch.save({
+            'model': self.q_net.state_dict(),
+            'target': self.target_net.state_dict(),
+            'optim': self.optim.state_dict(),
+            'steps': self.steps,
+            'eps': self.eps
+        }, path)
         
-    def load_checkpoint(self, filepath):
-        checkpoint = torch.load(filepath, map_location=self.device)
-        self.brain.load_state_dict(checkpoint['model_state'])
-        self.target_brain.load_state_dict(checkpoint['target_model_state'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        self.training_steps = checkpoint['training_steps']
-        self.exploration_rate = checkpoint['exploration_rate'] 
+    def load(self, path):
+        data = torch.load(path, map_location=self.device)
+        self.q_net.load_state_dict(data['model'])
+        self.target_net.load_state_dict(data['target'])
+        self.optim.load_state_dict(data['optim'])
+        self.steps = data['steps']
+        self.eps = data['eps'] 

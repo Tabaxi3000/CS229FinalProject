@@ -152,3 +152,118 @@ r = np.random.randint(0,y_val.shape[0] - batch)
 y_pred = model.predict(x_val[r:r+batch])
 print(y_pred.reshape((-1,)))
 print(y_val[r:r+batch].reshape((-1,)))
+
+def find_melds(hand):
+    if not hand:
+        return []
+        
+    melds = []
+    ranks = {}
+    suits = {}
+    
+    for card in hand:
+        rank = card % 13
+        suit = card // 13
+        ranks.setdefault(rank, []).append(card)
+        suits.setdefault(suit, []).append(card)
+        
+    for cards in ranks.values():
+        if len(cards) >= 3:
+            melds.append(cards[:])
+            
+    for cards in suits.values():
+        cards.sort(key=lambda x: x % 13)
+        i = 0
+        while i < len(cards) - 2:
+            run = [cards[i]]
+            j = i + 1
+            while j < len(cards) and cards[j] % 13 == (run[-1] % 13) + 1:
+                run.append(cards[j])
+                j += 1
+            if len(run) >= 3:
+                melds.append(run)
+            i = j if j > i + 1 else i + 1
+            
+    return melds
+
+def get_deadwood(hand, melds=None):
+    if not hand:
+        return float('inf')
+        
+    if melds is None:
+        melds = find_melds(hand)
+        
+    if not melds:
+        return sum(min(10, x % 13 + 1) for x in hand)
+        
+    min_deadwood = float('inf')
+    
+    for i in range(1 << len(melds)):
+        used = set()
+        valid = True
+        
+        for j in range(len(melds)):
+            if i & (1 << j):
+                meld = melds[j]
+                if any(card in used for card in meld):
+                    valid = False
+                    break
+                used.update(meld)
+                
+        if valid:
+            unmatched = [card for card in hand if card not in used]
+            deadwood = sum(min(10, x % 13 + 1) for x in unmatched)
+            min_deadwood = min(min_deadwood, deadwood)
+            
+    return min_deadwood
+
+def can_knock(hand):
+    return get_deadwood(hand) <= 10
+
+def can_gin(hand):
+    return get_deadwood(hand) == 0
+
+def get_best_discard(hand):
+    if not hand:
+        return None
+        
+    best_card = None
+    min_deadwood = float('inf')
+    
+    for card in hand:
+        test_hand = hand.copy()
+        test_hand.remove(card)
+        deadwood = get_deadwood(test_hand)
+        if deadwood < min_deadwood:
+            min_deadwood = deadwood
+            best_card = card
+            
+    return best_card
+
+def get_best_draw(hand, discard_top):
+    if not hand or discard_top is None:
+        return None
+        
+    old_deadwood = get_deadwood(hand)
+    test_hand = hand + [discard_top]
+    new_deadwood = get_deadwood(test_hand)
+    
+    return new_deadwood < old_deadwood
+
+def get_best_action(hand, discard_top, phase):
+    if phase == 'draw':
+        if discard_top is not None and get_best_draw(hand, discard_top):
+            return 1  # Draw from discard
+        return 0  # Draw from stock
+        
+    deadwood = get_deadwood(hand)
+    if deadwood == 0:
+        return 109  # Gin
+    if deadwood <= 10:
+        return 108  # Knock
+        
+    card = get_best_discard(hand)
+    if card is not None:
+        return card + 2  # Discard
+        
+    return None

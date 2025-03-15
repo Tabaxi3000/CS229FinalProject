@@ -3,293 +3,262 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import torch.nn.functional as F
-from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 import math
 import random
 from simple_evaluate import DRAW_STOCK, DRAW_DISCARD, DISCARD, KNOCK, GIN
 import time
 
-TOTAL_ACTIONS = 110
-EXPLORATION_CONSTANT = 1.41
-DISCOUNT_FACTOR = 0.8
-MAX_BRANCHING = 5
-PUCT_CONSTANT = 1.0
+N_ACTIONS = 110
+UCB_C = 1.41
+GAMMA = 0.8
+MAX_CHILDREN = 5
+C_PUCT = 1.0
 
-class GameNetwork(nn.Module):
-    def __init__(self, num_actions=110):
+class Net(nn.Module):
+    def __init__(self, n_actions=110):
         super().__init__()
         
-        self.hand_encoder = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU()
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.Dropout(0.2)
         )
         
-        self.history_processor = nn.LSTM(52, 128, batch_first=True)
-        self.opponent_encoder = nn.Linear(52, 64)
+        self.lstm = nn.LSTM(52, 128, batch_first=True)
+        self.opp_net = nn.Linear(52, 64)
         
-        self.decision_maker = nn.Sequential(
+        self.fc = nn.Sequential(
             nn.Linear(64 * 4 * 13 + 128 + 64, 256),
             nn.ReLU(),
             nn.Linear(256, 128),
             nn.ReLU()
         )
         
-        self.move_predictor = nn.Linear(128, num_actions)
-        self.position_evaluator = nn.Linear(128, 1)
+        self.policy = nn.Linear(128, n_actions)
+        self.value = nn.Linear(128, 1)
         
-    def forward(self, hand, history, opponent_info=None):
-        batch_size = hand.size(0)
+    def forward(self, hand, history, opp_info=None):
+        batch = hand.size(0)
         
         if hand.dim() == 3:
             hand = hand.unsqueeze(1)
             
-        encoded_hand = self.hand_encoder(hand.float())
-        flattened_hand = encoded_hand.view(batch_size, -1)
+        x = self.conv(hand.float())
+        x = x.view(batch, -1)
         
         history = history.float()
-        history_features, _ = self.history_processor(history)
-        last_state = history_features[:, -1, :]
+        h_out, _ = self.lstm(history)
+        h_out = h_out[:, -1]
         
-        if opponent_info is not None:
-            opponent_features = F.relu(self.opponent_encoder(opponent_info.float()))
+        if opp_info is not None:
+            opp = F.relu(self.opp_net(opp_info.float()))
         else:
-            opponent_features = torch.zeros(batch_size, 64, device=hand.device)
+            opp = torch.zeros(batch, 64, device=hand.device)
             
-        features = torch.cat([flattened_hand, last_state, opponent_features], dim=1)
-        
-        for layer in self.decision_maker:
-            features = layer(features)
+        x = torch.cat([x, h_out, opp], dim=1)
+        x = self.fc(x)
             
-        move_probs = F.softmax(self.move_predictor(features), dim=1)
-        position_value = torch.tanh(self.position_evaluator(features))
+        pi = F.softmax(self.policy(x), dim=1)
+        v = torch.tanh(self.value(x))
         
-        return move_probs, position_value
+        return pi, v
         
-    def load_weights(self, model_path, device=None):
-        if device is None:
+    def load(self, path, device=None):
+        if not device:
             device = next(self.parameters()).device
-        self.load_state_dict(torch.load(model_path, map_location=device))
+        self.load_state_dict(torch.load(path, map_location=device))
 
-class BeliefTracker:
-    def __init__(self, num_particles=100):
-        self.num_particles = num_particles
+class BeliefState:
+    def __init__(self, n_particles=100):
+        self.n = n_particles
         self.particles = []
-        self.weights = np.ones(num_particles) / num_particles
+        self.weights = np.ones(n_particles) / n_particles
         
-    def update_beliefs(self, observation):
-        sampled_indices = np.random.choice(
-            self.num_particles,
-            size=self.num_particles,
-            p=self.weights
-        )
+    def update(self, obs):
+        idx = np.random.choice(self.n, size=self.n, p=self.weights)
+        self.particles = [self.particles[i] for i in idx]
         
-        self.particles = [self.particles[i] for i in sampled_indices]
-        
-        for i, particle in enumerate(self.particles):
-            self.weights[i] *= self._get_likelihood(particle, observation)
+        for i, p in enumerate(self.particles):
+            self.weights[i] *= self._likelihood(p, obs)
             
         self.weights /= np.sum(self.weights)
         
-    def _get_likelihood(self, particle, observation):
+    def _likelihood(self, particle, obs):
         return 1.0
 
-class TreeNode:
-    def __init__(self, game_state, parent=None, move=None):
-        self.game_state = game_state
+class Node:
+    def __init__(self, state, parent=None, move=None):
+        self.state = state
         self.parent = parent
         self.move = move
-        self.children = {}
+        self.kids = {}
         self.visits = 0
-        self.total_value = 0
+        self.value = 0
         self.prior = 0
-        self.legal_moves = None
+        self.moves = None
         self.is_leaf = True
         
-    def expand(self, move_probabilities, legal_moves=None):
+    def expand(self, probs, moves=None):
         self.is_leaf = False
-        self.legal_moves = legal_moves if legal_moves else list(range(TOTAL_ACTIONS))
+        self.moves = moves if moves else list(range(N_ACTIONS))
         
-        if isinstance(move_probabilities, dict):
-            probs = torch.zeros(TOTAL_ACTIONS)
-            for move, prob in move_probabilities.items():
-                probs[move] = prob
-            move_probabilities = probs
+        if isinstance(probs, dict):
+            p = torch.zeros(N_ACTIONS)
+            for m, prob in probs.items():
+                p[m] = prob
+            probs = p
             
-        legal_moves_mask = torch.zeros_like(move_probabilities)
-        for move in self.legal_moves:
-            legal_moves_mask[move] = 1
+        mask = torch.zeros_like(probs)
+        for m in self.moves:
+            mask[m] = 1
             
-        masked_probs = move_probabilities * legal_moves_mask
-        if masked_probs.sum() > 0:
-            masked_probs = masked_probs / masked_probs.sum()
+        p = probs * mask
+        if p.sum() > 0:
+            p = p / p.sum()
         else:
-            masked_probs = legal_moves_mask / legal_moves_mask.sum()
+            p = mask / mask.sum()
             
-        for move in self.legal_moves:
-            if masked_probs[move] > 0:
-                self.children[move] = TreeNode(
-                    game_state=None,
-                    parent=self,
-                    move=move
-                )
-                self.children[move].prior = float(masked_probs[move])
+        for m in self.moves:
+            if p[m] > 0:
+                self.kids[m] = Node(None, self, m)
+                self.kids[m].prior = float(p[m])
                 
-    def select_best_child(self):
+    def best_child(self):
         best_score = float('-inf')
-        best_child = None
+        best_kid = None
         best_move = None
         
-        for move, child in self.children.items():
-            exploration = EXPLORATION_CONSTANT * child.prior * math.sqrt(self.visits)
-            exploitation = child.total_value / (child.visits + 1)
-            score = exploitation + exploration / (child.visits + 1)
+        for m, kid in self.kids.items():
+            explore = UCB_C * kid.prior * math.sqrt(self.visits)
+            exploit = kid.value / (kid.visits + 1)
+            score = exploit + explore / (kid.visits + 1)
             
             if score > best_score:
                 best_score = score
-                best_child = child
-                best_move = move
+                best_kid = kid
+                best_move = m
                 
-        return best_child, best_move
+        return best_kid, best_move
         
-    def update_stats(self, value):
+    def update(self, val):
         self.visits += 1
-        self.total_value += value
+        self.value += val
 
 class MCTS:
-    def __init__(self, network=None, num_simulations=100, temperature=1.0):
-        if torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
+    def __init__(self, net=None, n_sims=100, temp=1.0):
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else
+                                 "cuda" if torch.cuda.is_available() else "cpu")
             
-        self.network = network
-        self.num_simulations = num_simulations
-        self.temperature = temperature
+        self.net = net
+        self.n_sims = n_sims
+        self.temp = temp
         
-    def search(self, game_state):
-        root = TreeNode(game_state)
+    def search(self, state):
+        root = Node(state)
         
-        state_tensor = {
-            'hand_matrix': game_state['hand_matrix'].unsqueeze(0).to(self.device),
-            'discard_history': game_state['discard_history'].unsqueeze(0).to(self.device),
-            'valid_actions_mask': game_state['valid_actions_mask'].unsqueeze(0).to(self.device)
-        }
+        state = {k: v.unsqueeze(0).to(self.device) for k, v in state.items()}
         
         with torch.no_grad():
-            if self.network:
-                move_probs, _ = self.network(
-                    state_tensor['hand_matrix'],
-                    state_tensor['discard_history']
-                )
-                move_probs = move_probs.squeeze()
+            if self.net:
+                pi, _ = self.net(state['hand_matrix'], state['discard_history'])
+                pi = pi.squeeze()
             else:
-                move_probs = torch.ones(TOTAL_ACTIONS, device=self.device) / TOTAL_ACTIONS
+                pi = torch.ones(N_ACTIONS, device=self.device) / N_ACTIONS
                 
-        legal_moves = torch.nonzero(game_state['valid_actions_mask']).squeeze().tolist()
-        if isinstance(legal_moves, int):
-            legal_moves = [legal_moves]
+        moves = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
+        if isinstance(moves, int):
+            moves = [moves]
             
-        root.expand(move_probs, legal_moves)
+        root.expand(pi, moves)
         
-        for _ in range(self.num_simulations):
+        for _ in range(self.n_sims):
             node = root
             path = [node]
             
             while not node.is_leaf:
-                child, move = node.select_best_child()
-                node = child
+                kid, move = node.best_child()
+                node = kid
                 path.append(node)
                 
             if node.is_leaf and len(path) < 50:
-                node_state = node.game_state
-                node_tensor = {
-                    'hand_matrix': node_state['hand_matrix'].unsqueeze(0).to(self.device),
-                    'discard_history': node_state['discard_history'].unsqueeze(0).to(self.device),
-                    'valid_actions_mask': node_state['valid_actions_mask'].unsqueeze(0).to(self.device)
-                }
+                s = node.state
+                s = {k: v.unsqueeze(0).to(self.device) for k, v in s.items()}
                 
                 with torch.no_grad():
-                    if self.network:
-                        node_probs, node_value = self.network(
-                            node_tensor['hand_matrix'],
-                            node_tensor['discard_history']
-                        )
-                        node_probs = node_probs.squeeze()
-                        value = node_value.item()
+                    if self.net:
+                        pi, val = self.net(s['hand_matrix'], s['discard_history'])
+                        pi = pi.squeeze()
+                        val = val.item()
                     else:
-                        node_probs = torch.ones(TOTAL_ACTIONS, device=self.device) / TOTAL_ACTIONS
-                        value = self._simulate(node.game_state)
+                        pi = torch.ones(N_ACTIONS, device=self.device) / N_ACTIONS
+                        val = self._rollout(node.state)
                         
-                node_legal_moves = torch.nonzero(node_state['valid_actions_mask']).squeeze().tolist()
-                if isinstance(node_legal_moves, int):
-                    node_legal_moves = [node_legal_moves]
+                valid = torch.nonzero(s['valid_actions_mask']).squeeze().tolist()
+                if isinstance(valid, int):
+                    valid = [valid]
                     
-                node.expand(node_probs, node_legal_moves)
+                node.expand(pi, valid)
                 
             for node in reversed(path):
-                node.update_stats(value)
-                value = -value
+                node.update(val)
+                val = -val
                 
-        visit_counts = np.array([root.children[m].visits if m in root.children else 0 for m in legal_moves])
+        visits = np.array([root.kids[m].visits if m in root.kids else 0 for m in moves])
         
-        if self.temperature == 0:
-            best_move = legal_moves[np.argmax(visit_counts)]
-            move_probs = {m: 1.0 if m == best_move else 0.0 for m in legal_moves}
+        if self.temp == 0:
+            best = moves[np.argmax(visits)]
+            probs = {m: 1.0 if m == best else 0.0 for m in moves}
         else:
-            visit_counts = np.power(visit_counts, 1.0 / self.temperature)
-            visit_counts = visit_counts / np.sum(visit_counts)
-            move_probs = {legal_moves[i]: visit_counts[i] for i in range(len(legal_moves))}
+            visits = np.power(visits, 1.0 / self.temp)
+            visits = visits / np.sum(visits)
+            probs = {moves[i]: visits[i] for i in range(len(moves))}
             
-        return move_probs
+        return probs
         
-    def _simulate(self, state):
+    def _rollout(self, state):
         steps = 0
         max_steps = 50
         
         while steps < max_steps:
-            legal_moves = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
-            if isinstance(legal_moves, int):
-                legal_moves = [legal_moves]
+            moves = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
+            if isinstance(moves, int):
+                moves = [moves]
             return np.random.uniform(-1, 1)
             steps += 1
             
         return 0.0
 
 class MCTSAgent:
-    def __init__(self, network=None, num_simulations=100):
-        self.network = network
-        self.num_simulations = num_simulations
-        self.mcts = MCTS(network, num_simulations)
+    def __init__(self, net=None, n_sims=100):
+        self.net = net
+        self.n_sims = n_sims
+        self.mcts = MCTS(net, n_sims)
         
-    def choose_move(self, game_state, temperature=1.0, time_limit=5.0):
-        start_time = time.time()
-        move_probs = self.mcts.search(game_state)
+    def act(self, state, temp=1.0, time_limit=5.0):
+        start = time.time()
+        probs = self.mcts.search(state)
         
-        if time.time() - start_time > time_limit:
-            legal_moves = torch.nonzero(game_state['valid_actions_mask']).squeeze().tolist()
-            if isinstance(legal_moves, int):
-                legal_moves = [legal_moves]
-            return random.choice(legal_moves)
+        if time.time() - start > time_limit:
+            moves = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
+            if isinstance(moves, int):
+                moves = [moves]
+            return random.choice(moves)
             
-        moves = list(move_probs.keys())
-        probs = list(move_probs.values())
+        moves = list(probs.keys())
+        p = list(probs.values())
         
-        if temperature == 0:
-            chosen_move = moves[np.argmax(probs)]
+        if temp == 0:
+            return moves[np.argmax(p)]
         else:
-            chosen_move = np.random.choice(moves, p=probs)
+            return np.random.choice(moves, p=p)
             
-        return chosen_move
-        
-    def save_model(self, path):
-        if self.network:
-            torch.save(self.network.state_dict(), path)
+    def save(self, path):
+        if self.net:
+            torch.save(self.net.state_dict(), path)
             
-    def load_model(self, path):
-        if self.network:
-            self.network.load_weights(path) 
+    def load(self, path):
+        if self.net:
+            self.net.load(path) 

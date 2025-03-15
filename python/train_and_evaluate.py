@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Any
 plt.ion()  # Turn on interactive mode
 import json
-from multiprocessing import Process, Event
+from multiprocessing import Process, Event, Queue
 from dqn import DQNAgent, DQNetwork
 from reinforce import REINFORCEAgent, PolicyNetwork
 from mcts import MCTSAgent, PolicyValueNetwork

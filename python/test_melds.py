@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 from improved_gin_rummy_env import ImprovedGinRummyEnv
+import unittest
+from knock import find_melds, get_deadwood
 
 def test_meld_finding():
     env = ImprovedGinRummyEnv()
@@ -59,5 +61,50 @@ def test_meld_finding():
     print("Deadwood count:", env._calculate_deadwood(hand6))
     print()
 
-if __name__ == "__main__":
-    test_meld_finding() 
+class TestMelds(unittest.TestCase):
+    def test_empty_hand(self):
+        self.assertEqual(find_melds([]), [])
+        self.assertEqual(get_deadwood([]), float('inf'))
+        
+    def test_no_melds(self):
+        hand = [0, 13, 26, 39]  # All aces
+        self.assertEqual(find_melds(hand), [])
+        self.assertEqual(get_deadwood(hand), 4)
+        
+    def test_set_meld(self):
+        hand = [0, 13, 26]  # Three aces
+        melds = find_melds(hand)
+        self.assertEqual(len(melds), 1)
+        self.assertEqual(sorted(melds[0]), sorted(hand))
+        self.assertEqual(get_deadwood(hand), 0)
+        
+    def test_run_meld(self):
+        hand = [0, 1, 2]  # A-2-3 of spades
+        melds = find_melds(hand)
+        self.assertEqual(len(melds), 1)
+        self.assertEqual(sorted(melds[0]), sorted(hand))
+        self.assertEqual(get_deadwood(hand), 0)
+        
+    def test_multiple_melds(self):
+        hand = [0, 13, 26, 1, 2, 3]  # Three aces and 2-3-4 of spades
+        melds = find_melds(hand)
+        self.assertEqual(len(melds), 2)
+        self.assertEqual(get_deadwood(hand), 0)
+        
+    def test_overlapping_melds(self):
+        hand = [0, 1, 2, 13, 26]  # A-2-3 of spades and three aces
+        self.assertEqual(get_deadwood(hand), 0)
+        
+    def test_face_cards(self):
+        hand = [10, 11, 12]  # J-Q-K of spades
+        self.assertEqual(get_deadwood(hand), 30)
+        melds = find_melds(hand)
+        self.assertEqual(len(melds), 1)
+        self.assertEqual(get_deadwood(hand), 0)
+        
+    def test_mixed_values(self):
+        hand = [0, 5, 10]  # A-6-J of spades
+        self.assertEqual(get_deadwood(hand), 17)  # 1 + 6 + 10
+        
+if __name__ == '__main__':
+    unittest.main() 
