@@ -211,18 +211,132 @@ class MCTS:
         self.policy_network = policy_network
         self.value_network = value_network
         self.num_simulations = num_simulations
-        self.temperature = temperature  # Controls exploration vs exploitation
+        self.temperature = temperature
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            self.device = torch.device("mps")  # For Apple Silicon
+            self.device = torch.device("mps")
     
     def search(self, state: Dict) -> Dict[int, float]:
         """Perform MCTS from the given root state."""
-        # For testing, just return a uniform distribution over valid actions
+        root = MCTSNode(state)
+        
+        # Get policy predictions from neural network
+        state_tensor = {
+            'hand_matrix': state['hand_matrix'].unsqueeze(0).to(self.device),
+            'discard_history': state['discard_history'].unsqueeze(0).to(self.device),
+            'valid_actions_mask': state['valid_actions_mask'].unsqueeze(0).to(self.device)
+        }
+        
+        with torch.no_grad():
+            if self.policy_network:
+                policy_probs = self.policy_network(
+                    state_tensor['hand_matrix'],
+                    state_tensor['discard_history']
+                )[0].squeeze()
+            else:
+                # If no policy network, use uniform distribution
+                policy_probs = torch.ones(N_ACTIONS, device=self.device) / N_ACTIONS
+        
+        # Apply valid actions mask
         valid_actions = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
         if isinstance(valid_actions, int):
             valid_actions = [valid_actions]
-        return {action: 1.0 / len(valid_actions) for action in valid_actions}
+        
+        # Expand root with all valid actions
+        root.expand(policy_probs, valid_actions)
+        
+        # Perform simulations
+        for _ in range(self.num_simulations):
+            node = root
+            search_path = [node]
+            
+            # Selection phase - select best child until reaching a leaf node
+            while node.is_expanded():
+                child, action = node.select_child()
+                node = child
+                search_path.append(node)
+            
+            # Expansion and evaluation phase
+            if not node.is_expanded() and len(search_path) < 50:  # Prevent too deep searches
+                # Get policy predictions for this node
+                node_state = node.state
+                node_tensor = {
+                    'hand_matrix': node_state['hand_matrix'].unsqueeze(0).to(self.device),
+                    'discard_history': node_state['discard_history'].unsqueeze(0).to(self.device),
+                    'valid_actions_mask': node_state['valid_actions_mask'].unsqueeze(0).to(self.device)
+                }
+                
+                with torch.no_grad():
+                    if self.policy_network:
+                        node_policy_probs = self.policy_network(
+                            node_tensor['hand_matrix'],
+                            node_tensor['discard_history']
+                        )[0].squeeze()
+                    else:
+                        node_policy_probs = torch.ones(N_ACTIONS, device=self.device) / N_ACTIONS
+                
+                # Get valid actions for this node
+                node_valid_actions = torch.nonzero(node_state['valid_actions_mask']).squeeze().tolist()
+                if isinstance(node_valid_actions, int):
+                    node_valid_actions = [node_valid_actions]
+                
+                # Expand node
+                node.expand(node_policy_probs, node_valid_actions)
+            
+            # Get value prediction
+            if self.value_network:
+                with torch.no_grad():
+                    value = self.value_network(
+                        state_tensor['hand_matrix'],
+                        state_tensor['discard_history']
+                    ).item()
+            else:
+                # If no value network, use rollout
+                value = self._rollout(node.state)
+            
+            # Backpropagation phase
+            for node in reversed(search_path):
+                node.update(value)
+                value = -value  # Flip value for opponent's perspective
+        
+        # Calculate action probabilities based on visit counts
+        visits = np.array([root.children[a].visit_count if a in root.children else 0 for a in valid_actions])
+        
+        # Apply temperature
+        if self.temperature == 0:
+            # Choose action with highest visit count
+            best_action = valid_actions[np.argmax(visits)]
+            probs = {a: 1.0 if a == best_action else 0.0 for a in valid_actions}
+        else:
+            # Apply temperature and normalize
+            visits = np.power(visits, 1.0 / self.temperature)
+            visits = visits / np.sum(visits)
+            probs = {valid_actions[i]: visits[i] for i in range(len(valid_actions))}
+        
+        return probs
+    
+    def _rollout(self, state: Dict) -> float:
+        """Perform a random rollout from the given state."""
+        max_steps = 50  # Prevent infinite rollouts
+        current_state = state
+        done = False
+        steps = 0
+        
+        while not done and steps < max_steps:
+            valid_actions = torch.nonzero(current_state['valid_actions_mask']).squeeze().tolist()
+            if isinstance(valid_actions, int):
+                valid_actions = [valid_actions]
+            
+            # Choose random action
+            action = np.random.choice(valid_actions)
+            
+            # Take action (this requires environment - for now just return random value)
+            # In practice, you would want to use a copy of the environment to simulate actions
+            return np.random.uniform(-1, 1)
+            
+            steps += 1
+        
+        return 0.0  # Default value for timeout
 
 class MCTSValueNetwork(nn.Module):
     """Neural network to predict state values for MCTS."""
@@ -322,7 +436,7 @@ class MCTSAgent:
         self.value_network = value_network
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            self.device = torch.device("mps")  # For Apple Silicon
+            self.device = torch.device("mps")
     
     def select_action(self, state: Dict, temperature: float = 1.0, timeout: float = 5.0) -> int:
         """Select an action based on MCTS search with a timeout."""
@@ -332,8 +446,14 @@ class MCTSAgent:
         # Set a timeout for the MCTS search
         start_time = time.time()
         
+        # Move state to device
+        state_device = {
+            'hand_matrix': state['hand_matrix'].to(self.device),
+            'discard_history': state['discard_history'].to(self.device),
+            'valid_actions_mask': state['valid_actions_mask'].to(self.device)
+        }
+        
         # Perform MCTS search with timeout
-        action_probs = {}
         try:
             # Set a timeout for the search
             import signal
@@ -348,13 +468,8 @@ class MCTSAgent:
                 signal.signal(signal.SIGALRM, timeout_handler)
                 signal.alarm(int(timeout))
             
-            # Perform the search with a time check for Windows or as backup
-            search_start_time = time.time()
-            action_probs = self.mcts.search(state)
-            
-            # Check if we've exceeded the timeout (for Windows or as backup)
-            if time.time() - search_start_time > timeout:
-                raise TimeoutError("MCTS search timed out (time check)")
+            # Perform the search
+            action_probs = self.mcts.search(state_device)
             
             # Cancel the timeout
             if platform.system() != "Windows":
@@ -365,35 +480,38 @@ class MCTSAgent:
             # Fall back to using the policy network directly
             if self.policy_network:
                 with torch.no_grad():
-                    hand_matrix = state['hand_matrix'].to(self.device)
-                    discard_history = state['discard_history'].to(self.device)
-                    policy_probs, _ = self.policy_network(hand_matrix, discard_history)
-                    policy_probs = policy_probs[0].cpu().numpy()
+                    policy_probs = self.policy_network(
+                        state_device['hand_matrix'].unsqueeze(0),
+                        state_device['discard_history'].unsqueeze(0)
+                    )[0].squeeze()
                     
-                    # Create action probabilities dictionary
-                    valid_actions = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
+                    # Apply mask and normalize
+                    policy_probs = policy_probs * state_device['valid_actions_mask']
+                    policy_probs = policy_probs / (policy_probs.sum() + 1e-8)
+                    
+                    # Convert to dictionary format
+                    valid_actions = torch.nonzero(state_device['valid_actions_mask']).squeeze().tolist()
                     if isinstance(valid_actions, int):
                         valid_actions = [valid_actions]
-                    action_probs = {action: policy_probs[action] for action in valid_actions}
+                    action_probs = {action: float(policy_probs[action]) for action in valid_actions}
             else:
                 # If no policy network, use uniform distribution
-                valid_actions = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
+                valid_actions = torch.nonzero(state_device['valid_actions_mask']).squeeze().tolist()
                 if isinstance(valid_actions, int):
                     valid_actions = [valid_actions]
                 action_probs = {action: 1.0 / len(valid_actions) for action in valid_actions}
-        
-        # If no action probabilities, use uniform distribution
-        if not action_probs:
-            valid_actions = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
-            if isinstance(valid_actions, int):
-                valid_actions = [valid_actions]
-            action_probs = {action: 1.0 / len(valid_actions) for action in valid_actions}
         
         # Sample action from probabilities
         actions, probs = zip(*action_probs.items())
         probs = np.array(probs)
         probs = probs / probs.sum()  # Normalize
-        action = np.random.choice(actions, p=probs)
+        
+        if temperature == 0:
+            # Choose action with highest probability
+            action = actions[np.argmax(probs)]
+        else:
+            # Sample action based on probabilities
+            action = np.random.choice(actions, p=probs)
         
         return action
     

@@ -11,6 +11,8 @@ matplotlib.use('TkAgg')  # Use TkAgg backend
 import matplotlib.pyplot as plt
 from typing import List, Dict, Any
 plt.ion()  # Turn on interactive mode
+import json
+from multiprocessing import Process, Event
 
 # Import our models and environment
 from dqn import DQNAgent, DQNetwork
@@ -223,44 +225,32 @@ def print_progress(metrics: Dict[str, List[float]], episode: int) -> None:
     print(f"Best Reward:   {max(metrics['episode_rewards']):.3f}")
     print("-" * 50)
 
-def train_reinforce(
-    env: ImprovedGinRummyEnv,
-    agent: REINFORCEAgent,
-    num_episodes: int,
-    eval_interval: int = 100,
-    save_dir: str = "models"
-) -> Dict[str, List[float]]:
-    """Train REINFORCE agent and track metrics."""
-    os.makedirs(save_dir, exist_ok=True)
+def train_reinforce(env, agent, num_episodes=10000, eval_interval=100):
+    """Train a REINFORCE agent."""
+    # Progress bar
+    pbar = tqdm(range(num_episodes), desc="Training REINFORCE")
     
-    metrics = {
-        'episode_rewards': [],
-        'policy_losses': [],
-        'value_losses': [],
-        'entropies': [],
-        'eval_rewards': []
-    }
+    # Metrics
+    episode_rewards = []
+    policy_losses = []
+    value_losses = []
+    win_rates = []
     
     # Create rules-based opponent for evaluation
-    eval_opponent = RulesBasedAgent()
+    rules_opponent = RulesBasedAgent()
     
-    # Disable environment printing
-    env.print_state = lambda: None
-    
-    # Progress bar for episodes
-    progress_bar = tqdm(range(num_episodes), desc="Training Progress")
-    
-    for episode in progress_bar:
+    for episode in pbar:
+        # Reset environment
         state = env.reset()
-        done = False
         episode_reward = 0
-        
-        # Episode progress bar
-        episode_steps = tqdm(total=100, desc="Episode Steps", leave=False)
+        done = False
         
         while not done:
+            # Select action
             action = agent.select_action(state)
-            next_state, reward, done, truncated, info = env.step(action)
+            
+            # Take action
+            next_state, reward, done, info = env.step(action)
             
             # Store experience
             agent.store_experience(
@@ -271,251 +261,410 @@ def train_reinforce(
                 done=done
             )
             
+            # Update state and reward
             state = next_state
             episode_reward += reward
-            episode_steps.update(1)
-        
-        episode_steps.close()
         
         # Train on episode
         losses = agent.train()
         
-        # Record metrics
-        metrics['episode_rewards'].append(episode_reward)
-        metrics['policy_losses'].append(losses['policy_loss'])
-        metrics['value_losses'].append(losses['value_loss'])
-        metrics['entropies'].append(losses['entropy'])
+        # Store metrics
+        episode_rewards.append(episode_reward)
+        if losses:
+            policy_losses.append(losses['policy_loss'])
+            value_losses.append(losses['value_loss'])
         
-        # Update progress bar with current metrics
-        progress_bar.set_postfix({
-            'reward': f"{episode_reward:.2f}",
-            'policy_loss': f"{losses['policy_loss']:.2f}",
-            'value_loss': f"{losses['value_loss']:.2f}",
-            'entropy': f"{losses['entropy']:.2f}"
-        })
-        
-        # Evaluate periodically
+        # Evaluate agent
         if (episode + 1) % eval_interval == 0:
-            eval_reward = evaluate_against_rules(agent, eval_opponent, env, num_games=50)
-            metrics['eval_rewards'].append(eval_reward)
+            win_rate = evaluate_agent(env, agent, num_games=20)
+            win_rates.append(win_rate)
             
-            # Save model
-            agent.save(os.path.join(save_dir, f"reinforce_episode_{episode+1}.pt"))
+            # Update progress bar
+            avg_reward = sum(episode_rewards[-eval_interval:]) / eval_interval
+            avg_policy_loss = sum(policy_losses[-eval_interval:]) / max(1, len(policy_losses[-eval_interval:]))
+            avg_value_loss = sum(value_losses[-eval_interval:]) / max(1, len(value_losses[-eval_interval:]))
             
-            # Print progress
-            print_progress(metrics, episode + 1)
+            pbar.set_postfix({
+                'reward': f'{avg_reward:.2f}',
+                'policy_loss': f'{avg_policy_loss:.2f}',
+                'value_loss': f'{avg_value_loss:.2f}',
+                'win_rate': f'{win_rate:.2f}'
+            })
+            
+            # Save metrics
+            metrics = {
+                'episode_rewards': episode_rewards,
+                'policy_losses': policy_losses,
+                'value_losses': value_losses,
+                'win_rates': win_rates,
+                'eval_episodes': list(range(eval_interval, episode + 2, eval_interval))
+            }
+            
+            with open('metrics/reinforce_metrics.json', 'w') as f:
+                json.dump(metrics, f)
+            
+            # Plot metrics
+            plot_metrics(metrics, 'reinforce')
+            
+            # Save model if best win rate
+            if win_rate >= max(win_rates):
+                agent.save('models/reinforce_best.pt')
+                print(f"\nNew best model saved with win rate: {win_rate:.2f}")
     
-    return metrics
+    return episode_rewards, policy_losses, value_losses, win_rates
 
-def evaluate_against_rules(
-    agent: REINFORCEAgent,
-    opponent: RulesBasedAgent,
-    env: ImprovedGinRummyEnv,
-    num_games: int = 100
-) -> float:
-    """Evaluate agent against rules-based opponent."""
-    total_reward = 0
+def save_metrics(metrics: Dict[str, Any], agent_type: str):
+    """Save metrics to JSON file with proper error handling."""
+    try:
+        # Ensure metrics directory exists
+        os.makedirs('metrics', exist_ok=True)
+        
+        # Convert numpy arrays and tensors to lists
+        serializable_metrics = {}
+        for key, value in metrics.items():
+            if isinstance(value, (np.ndarray, list)):
+                serializable_metrics[key] = [float(v) if isinstance(v, (np.floating, np.integer)) else v for v in value]
+            elif isinstance(value, (np.floating, np.integer)):
+                serializable_metrics[key] = float(value)
+            else:
+                serializable_metrics[key] = value
+        
+        # Save metrics
+        metrics_path = f'metrics/{agent_type}_metrics.json'
+        with open(metrics_path, 'w') as f:
+            json.dump(serializable_metrics, f, indent=2)
+        print(f"\nSaved metrics to {metrics_path}")
+    except Exception as e:
+        print(f"\nWarning: Failed to save metrics: {str(e)}")
+
+def train_dqn(env, agent, num_episodes=10000, eval_interval=100):
+    """Train a DQN agent."""
+    # Progress bar
+    pbar = tqdm(range(num_episodes), desc="Training DQN")
     
-    # Disable environment printing
-    env.print_state = lambda: None
+    # Metrics
+    episode_rewards = []
+    losses = []
+    win_rates = []
+    epsilons = []
     
-    # Progress bar for evaluation games
-    for _ in tqdm(range(num_games), desc="Evaluating", leave=False):
+    # Epsilon schedule
+    epsilon_start = 1.0
+    epsilon_end = 0.05
+    epsilon_decay = 0.995
+    
+    for episode in pbar:
+        # Reset environment
+        state = env.reset()
+        episode_reward = 0
+        done = False
+        
+        # Calculate epsilon
+        epsilon = max(epsilon_end, epsilon_start * (epsilon_decay ** episode))
+        
+        while not done:
+            # Select action
+            action = agent.select_action(state, epsilon)
+            
+            # Take action
+            next_state, reward, done, info = env.step(action)
+            
+            # Store transition using keyword arguments
+            agent.memory.push(
+                state=state,
+                action=action,
+                reward=reward,
+                next_state=next_state,
+                done=done
+            )
+            
+            # Optimize model
+            loss = agent.optimize_model()
+            if loss is not None:
+                losses.append(loss)
+            
+            # Update state and reward
+            state = next_state
+            episode_reward += reward
+        
+        # Store metrics
+        episode_rewards.append(episode_reward)
+        epsilons.append(epsilon)
+        
+        # Evaluate agent periodically
+        if (episode + 1) % eval_interval == 0:
+            win_rate = evaluate_agent(env, agent, num_games=20)
+            win_rates.append(win_rate)
+            
+            # Save metrics
+            metrics = {
+                'episode_rewards': episode_rewards,
+                'losses': losses,
+                'win_rates': win_rates,
+                'epsilons': epsilons,
+                'eval_episodes': list(range(eval_interval, episode + 2, eval_interval))
+            }
+            
+            # Save metrics using the new function
+            save_metrics(metrics, 'dqn')
+            
+            # Create and save plots
+            plt.figure(figsize=(15, 5))
+            
+            # Plot episode rewards
+            plt.subplot(1, 3, 1)
+            plt.plot(episode_rewards)
+            plt.title('Episode Rewards')
+            plt.xlabel('Episode')
+            plt.ylabel('Reward')
+            
+            # Plot losses
+            plt.subplot(1, 3, 2)
+            if losses:
+                plt.plot(losses)
+                plt.title('Training Loss')
+                plt.xlabel('Optimization Step')
+                plt.ylabel('Loss')
+            
+            # Plot win rates
+            plt.subplot(1, 3, 3)
+            plt.plot(range(eval_interval, episode + 2, eval_interval), win_rates)
+            plt.title('Win Rate vs Random Opponent')
+            plt.xlabel('Episode')
+            plt.ylabel('Win Rate')
+            
+            plt.tight_layout()
+            plt.savefig(f"plots/training_metrics_episode_{episode + 1}.png")
+            plt.close()
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'reward': f'{episode_rewards[-1]:.2f}',
+                'loss': f'{losses[-1]:.4f}' if losses else 'N/A',
+                'epsilon': f'{epsilon:.2f}',
+                'win_rate': f'{win_rate:.2f}'
+            })
+            
+            # Save model if best win rate
+            if win_rate >= max(win_rates):
+                agent.save('models/dqn_best.pt')
+                print(f"\nNew best model saved with win rate: {win_rate:.2f}")
+    
+    return episode_rewards, losses, win_rates, epsilons
+
+def train_mcts(env, agent, num_episodes=10000, eval_interval=100, save_path="models/mcts"):
+    """Train an MCTS agent."""
+    # Progress bar
+    pbar = tqdm(range(num_episodes), desc="Training MCTS")
+    
+    # Metrics
+    episode_rewards = []
+    win_rates = []
+    best_win_rate = 0.0
+    
+    # Create directories if they don't exist
+    os.makedirs("models", exist_ok=True)
+    os.makedirs("metrics", exist_ok=True)
+    os.makedirs("plots", exist_ok=True)
+    
+    # Training loop
+    for episode in pbar:
+        # Reset environment
+        state = env.reset()
+        episode_reward = 0
+        done = False
+        
+        # Temperature annealing
+        temperature = max(0.1, 1.0 - episode / num_episodes)
+        
+        while not done:
+            # Select action using MCTS with current temperature
+            action = agent.select_action(state, temperature=temperature)
+            
+            # Take action
+            next_state, reward, done, info = env.step(action)
+            
+            # Update state and reward
+            state = next_state
+            episode_reward += reward
+        
+        # Store metrics
+        episode_rewards.append(episode_reward)
+        
+        # Evaluate agent periodically
+        if (episode + 1) % eval_interval == 0:
+            win_rate = evaluate_agent(env, agent, num_games=20)
+            win_rates.append(win_rate)
+            
+            # Save model if it's the best so far
+            if win_rate > best_win_rate:
+                best_win_rate = win_rate
+                agent.save(f"{save_path}_best")
+            
+            # Save metrics
+            metrics = {
+                'episode_rewards': episode_rewards,
+                'win_rates': win_rates,
+                'eval_episodes': list(range(eval_interval, episode + 2, eval_interval))
+            }
+            
+            with open(f"metrics/mcts_metrics.json", 'w') as f:
+                json.dump(metrics, f)
+            
+            # Create and save plots
+            plt.figure(figsize=(12, 4))
+            
+            # Plot episode rewards
+            plt.subplot(1, 2, 1)
+            plt.plot(episode_rewards)
+            plt.title('Episode Rewards')
+            plt.xlabel('Episode')
+            plt.ylabel('Reward')
+            
+            # Plot win rates
+            plt.subplot(1, 2, 2)
+            plt.plot(range(eval_interval, episode + 2, eval_interval), win_rates)
+            plt.title('Win Rate vs Random Opponent')
+            plt.xlabel('Episode')
+            plt.ylabel('Win Rate')
+            
+            plt.tight_layout()
+            plt.savefig(f"plots/training_metrics_episode_{episode + 1}.png")
+            plt.close()
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'Reward': episode_rewards[-1],
+                'Win Rate': win_rates[-1],
+                'Best Win Rate': best_win_rate
+            })
+    
+    # Save final model
+    agent.save(f"{save_path}_final")
+    
+    return episode_rewards, win_rates
+
+def evaluate_agent(env, agent, num_games=20):
+    """Evaluate agent against random opponent."""
+    wins = 0
+    
+    for _ in range(num_games):
         state = env.reset()
         done = False
         
         while not done:
             # Agent's turn
             if env.current_player == 0:
-                action = agent.select_action(state)
+                # Use MCTS with temperature=0 for deterministic play
+                action = agent.select_action(state, temperature=0)
             else:
-                action = opponent.select_action(state)
+                # Random opponent
+                valid_actions = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
+                if isinstance(valid_actions, int):
+                    valid_actions = [valid_actions]
+                action = random.choice(valid_actions)
             
-            state, reward, done, truncated, info = env.step(action)
-            if env.current_player == 0:  # Only count agent's rewards
-                total_reward += reward
+            # Take action
+            state, reward, done, info = env.step(action)
+        
+        # Check if agent won
+        if info.get('winner', -1) == 0:
+            wins += 1
     
-    return total_reward / num_games
-
-def plot_metrics(metrics: Dict[str, List[float]], episode: int) -> None:
-    """Plot training metrics in real-time."""
-    plt.clf()  # Clear the current figure
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
-    fig.suptitle(f'Training Metrics (Episode {episode})')
-    
-    # Plot episode rewards
-    ax1.plot(metrics['episode_rewards'], label='Episode Reward')
-    ax1.set_title('Episode Rewards')
-    ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Reward')
-    ax1.legend()
-    
-    # Plot losses
-    ax2.plot(metrics['policy_losses'], label='Policy Loss', color='red')
-    ax2.plot(metrics['value_losses'], label='Value Loss', color='blue')
-    ax2.set_title('Training Losses')
-    ax2.set_xlabel('Episode')
-    ax2.set_ylabel('Loss')
-    ax2.legend()
-    
-    # Plot entropy
-    ax3.plot(metrics['entropies'], label='Entropy', color='green')
-    ax3.set_title('Policy Entropy')
-    ax3.set_xlabel('Episode')
-    ax3.set_ylabel('Entropy')
-    ax3.legend()
-    
-    # Plot evaluation rewards
-    eval_episodes = list(range(0, episode + 1, 100))[1:]  # Every 100 episodes
-    if metrics['eval_rewards']:  # Only plot if we have evaluation data
-        ax4.plot(eval_episodes, metrics['eval_rewards'], label='Eval Reward', color='purple')
-        ax4.set_title('Evaluation Rewards')
-        ax4.set_xlabel('Episode')
-        ax4.set_ylabel('Average Reward')
-        ax4.legend()
-    
-    plt.tight_layout()
-    
-    # Create plots directory if it doesn't exist
-    os.makedirs('plots', exist_ok=True)
-    
-    # Save the current plot
-    plt.savefig(f'plots/training_metrics_episode_{episode}.png')
-    
-    # Show the plot
-    plt.show()
-    plt.pause(0.1)  # Small pause to update the plots
+    return wins / num_games
 
 def main():
-    """Main function"""
+    """Main training function."""
     parser = argparse.ArgumentParser(description='Train and evaluate Gin Rummy agents')
     parser.add_argument('--train', action='store_true', help='Train the agents')
-    parser.add_argument('--evaluate', action='store_true', help='Evaluate the agents')
+    parser.add_argument('--eval', action='store_true', help='Evaluate the agents')
     parser.add_argument('--episodes', type=int, default=10000, help='Number of episodes for training')
-    parser.add_argument('--eval-games', type=int, default=1000, help='Number of games for evaluation')
-    parser.add_argument('--verbose', action='store_true', help='Print detailed output')
+    parser.add_argument('--eval-games', type=int, default=100, help='Number of games for evaluation')
     args = parser.parse_args()
     
-    if not args.train and not args.evaluate:
-        parser.print_help()
-        return
-    
-    # Set random seeds
-    torch.manual_seed(42)
-    np.random.seed(42)
+    # Create directories
+    os.makedirs('models', exist_ok=True)
+    os.makedirs('metrics', exist_ok=True)
+    os.makedirs('plots', exist_ok=True)
     
     if args.train:
-        # Create environments and agents
-        env_reinforce = ImprovedGinRummyEnv()
-        env_dqn = ImprovedGinRummyEnv()
-        env_mcts = ImprovedGinRummyEnv()
+        print("Starting parallel training of all agents...")
+        print("Press Ctrl+C to stop training and save current progress")
         
-        reinforce_agent = REINFORCEAgent()
-        dqn_agent = ImprovedDQNAgent()
+        # Create environment and agents
+        env = ImprovedGinRummyEnv(verbose=False)  # Disable printing to avoid clutter
+        dqn_agent = DQNAgent()
         mcts_agent = MCTSAgent()
         
-        # Disable all printing from environments
-        for env in [env_reinforce, env_dqn, env_mcts]:
-            env.print_state = lambda: None
-            env.print_action = lambda x: None
-            env.print_reward = lambda x: None
+        # Create processes for each agent
+        stop_event = Event()
         
-        # Dictionary to store metrics for all agents
-        all_metrics = {
-            'reinforce': {'metrics': None, 'agent': reinforce_agent},
-            'dqn': {'metrics': None, 'agent': dqn_agent},
-            'mcts': {'metrics': None, 'agent': mcts_agent}
-        }
+        def train_dqn_process():
+            try:
+                train_dqn(env, dqn_agent, num_episodes=args.episodes)
+            except KeyboardInterrupt:
+                print("\nSaving DQN agent...")
+                dqn_agent.save('models/dqn_interrupted.pt')
+            
+        def train_mcts_process():
+            try:
+                train_mcts(env, mcts_agent, num_episodes=args.episodes)
+            except KeyboardInterrupt:
+                print("\nSaving MCTS agent...")
+                mcts_agent.save('models/mcts_interrupted.pt')
+        
+        # Start processes
+        dqn_process = Process(target=train_dqn_process)
+        mcts_process = Process(target=train_mcts_process)
         
         try:
-            print("Starting parallel training of all agents...")
-            print("Press Ctrl+C to stop training and save current progress")
+            dqn_process.start()
+            mcts_process.start()
             
-            # Train REINFORCE
-            metrics_reinforce = train_reinforce(
-                env=env_reinforce,
-                agent=reinforce_agent,
-                num_episodes=args.episodes,
-                eval_interval=100
-            )
-            all_metrics['reinforce']['metrics'] = metrics_reinforce
-            
-            # Train DQN
-            metrics_dqn = train_dqn(
-                env=env_dqn,
-                agent=dqn_agent,
-                num_episodes=args.episodes,
-                eval_interval=100
-            )
-            all_metrics['dqn']['metrics'] = metrics_dqn
-            
-            # Train MCTS
-            metrics_mcts = train_mcts(
-                env=env_mcts,
-                agent=mcts_agent,
-                num_episodes=args.episodes,
-                eval_interval=100
-            )
-            all_metrics['mcts']['metrics'] = metrics_mcts
+            # Wait for processes to complete
+            dqn_process.join()
+            mcts_process.join()
             
         except KeyboardInterrupt:
-            print("\nTraining interrupted! Saving current progress...")
+            print("\nTraining interrupted! Saving current state...")
+            stop_event.set()
             
-            # Save all agents' current state
-            for name, data in all_metrics.items():
-                if data['metrics'] is not None:
-                    save_path = os.path.join('models', f'{name}_interrupted.pt')
-                    data['agent'].save(save_path)
-                    print(f"Saved {name} model to {save_path}")
+            # Wait for processes to finish
+            dqn_process.join(timeout=5)
+            mcts_process.join(timeout=5)
             
-            print("All progress saved. You can resume training later.")
-            return
-        
-        # Save final models
-        for name, data in all_metrics.items():
-            if data['metrics'] is not None:
-                save_path = os.path.join('models', f'{name}_final.pt')
-                data['agent'].save(save_path)
-                print(f"Saved {name} model to {save_path}")
+            # Force terminate if needed
+            if dqn_process.is_alive():
+                dqn_process.terminate()
+            if mcts_process.is_alive():
+                mcts_process.terminate()
+            
+            print("Training stopped.")
     
-    if args.evaluate:
-        # Create environment and agents
+    if args.eval:
+        print("\nEvaluating agents...")
+        
+        # Create environment and load agents
         env = ImprovedGinRummyEnv()
-        reinforce_agent = REINFORCEAgent()
-        dqn_agent = ImprovedDQNAgent()
+        dqn_agent = DQNAgent()
         mcts_agent = MCTSAgent()
         rules_agent = RulesBasedAgent()
         
-        # Disable environment printing
-        env.print_state = lambda: None
-        env.print_action = lambda x: None
-        env.print_reward = lambda x: None
+        # Load best models
+        try:
+            dqn_agent.load('models/dqn_best.pt')
+            mcts_agent.load('models/mcts_best.pt')
+        except:
+            print("Warning: Could not load all model files. Using latest available models.")
         
-        # Load latest models if available
-        for agent_name, agent in [
-            ('reinforce', reinforce_agent),
-            ('dqn', dqn_agent),
-            ('mcts', mcts_agent)
-        ]:
-            model_files = [f for f in os.listdir('models') if f.startswith(f'{agent_name}_')]
-            if model_files:
-                latest_model = max(model_files, key=lambda x: int(x.split('_')[2].split('.')[0]) if x.split('_')[2].split('.')[0].isdigit() else 0)
-                print(f"Loading {agent_name} model: {latest_model}")
-                agent.load(os.path.join('models', latest_model))
+        # Evaluate against rules-based opponent
+        print("\nEvaluating against rules-based opponent...")
+        dqn_wr = evaluate_agent(env, dqn_agent, num_games=args.eval_games)
+        mcts_wr = evaluate_agent(env, mcts_agent, num_games=args.eval_games)
         
-        # Evaluate all agents against rules-based agent
-        for agent_name, agent in [
-            ('REINFORCE', reinforce_agent),
-            ('DQN', dqn_agent),
-            ('MCTS', mcts_agent)
-        ]:
-            final_reward = evaluate_against_rules(
-                agent=agent,
-                opponent=rules_agent,
-                env=env,
-                num_games=args.eval_games
-            )
-            print(f"{agent_name} evaluation reward against rules-based agent: {final_reward:.2f}")
+        print(f"\nResults against rules-based opponent ({args.eval_games} games):")
+        print(f"DQN win rate: {dqn_wr:.2f}")
+        print(f"MCTS win rate: {mcts_wr:.2f}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main() 

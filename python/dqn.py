@@ -21,7 +21,7 @@ Experience = namedtuple('Experience', ['state', 'action', 'reward', 'next_state'
 
 class DQNetwork(nn.Module):
     """Deep Q-Network for Gin Rummy."""
-    def __init__(self, action_space=110):
+    def __init__(self, state_dim=(1, 4, 13), action_dim=110, hidden_dim=128):
         super(DQNetwork, self).__init__()
         
         # Convolutional layers for processing hand matrix
@@ -36,12 +36,12 @@ class DQNetwork(nn.Module):
         self.lstm = nn.LSTM(52, 128, batch_first=True)
         
         # Fully connected layers
-        self.fc1 = nn.Linear(64 * 4 * 13 + 128, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, action_space)
+        self.fc1 = nn.Linear(64 * 4 * 13 + 128, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, action_dim)
         
         # Action bias
-        self.action_bias = nn.Parameter(torch.zeros(1, action_space))
+        self.action_bias = nn.Parameter(torch.zeros(1, action_dim))
         
         # Dropout for regularization
         self.dropout = nn.Dropout(0.2)
@@ -71,6 +71,10 @@ class DQNetwork(nn.Module):
         
         # Process discard history through LSTM
         discard_history = discard_history.float()
+        # Reshape discard history if needed
+        if discard_history.dim() == 4:  # If [batch, seq_len, height, width]
+            discard_history = discard_history.view(batch_size, -1, 52)  # Reshape to [batch, seq_len, features]
+        
         lstm_out, _ = self.lstm(discard_history)
         
         # Take the last output from the LSTM
@@ -129,51 +133,51 @@ class ReplayBuffer:
 
 class DQNAgent:
     """DQN agent for Gin Rummy."""
-    def __init__(self, model=None, epsilon=0.1):
-        self.model = model if model else DQNetwork()
-        self.epsilon = epsilon
+    
+    def __init__(self, state_dim=(1, 4, 13), action_dim=110, hidden_dim=128):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-            self.device = torch.device("mps")  # For Apple Silicon
-        self.model.to(self.device)
+            self.device = torch.device("mps")
         
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.model = DQNetwork(state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim).to(self.device)
+        self.target_model = DQNetwork(state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim).to(self.device)
+        self.target_model.load_state_dict(self.model.state_dict())
+        self.target_model.eval()
+        
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001)
         self.memory = ReplayBuffer(BUFFER_SIZE)
-        
         self.steps_done = 0
-        self.eps_start = 0.9
-        self.eps_end = 0.05
-        self.eps_decay = 200
         self.current_loss = None
         
-    def select_action(self, state, epsilon=None):
+    def select_action(self, state, epsilon=0.1):
         """Select an action using epsilon-greedy policy."""
-        if epsilon is None:
-            epsilon = self.epsilon
-        
-        # With probability epsilon, select a random action
         if random.random() < epsilon:
+            # Random action
             valid_actions = torch.nonzero(state['valid_actions_mask']).squeeze().tolist()
             if isinstance(valid_actions, int):
                 valid_actions = [valid_actions]
             return random.choice(valid_actions)
         
-        # Otherwise, select the action with the highest Q-value
         with torch.no_grad():
-            hand_matrix = state['hand_matrix'].to(self.device)
-            discard_history = state['discard_history'].to(self.device)
-            valid_actions_mask = state['valid_actions_mask'].to(self.device)
+            # Move state to device and ensure correct shapes
+            state_device = {
+                'hand_matrix': state['hand_matrix'].unsqueeze(0).to(self.device),
+                'discard_history': state['discard_history'].unsqueeze(0).to(self.device),
+                'valid_actions_mask': state['valid_actions_mask'].unsqueeze(0).to(self.device)
+            }
             
-            q_values = self.model(hand_matrix, discard_history)
+            # Get Q-values
+            q_values = self.model(
+                state_device['hand_matrix'],
+                state_device['discard_history'],
+                state_device['valid_actions_mask']
+            )
             
             # Mask invalid actions
-            q_values = q_values.squeeze()
-            q_values[~valid_actions_mask.bool()] = float('-inf')
+            masked_q_values = q_values.clone()
+            masked_q_values[~state_device['valid_actions_mask'].bool()] = float('-inf')
             
-            # Select the action with the highest Q-value
-            action = q_values.argmax().item()
-        
-        return action
+            return masked_q_values.squeeze(0).argmax().item()
     
     def optimize_model(self):
         """Perform one step of optimization."""
@@ -186,65 +190,84 @@ class DQNAgent:
         
         # Convert to tensors
         state_batch = {
-            'hand_matrix': torch.cat([s['hand_matrix'] for s in batch.state]),
-            'discard_history': torch.cat([s['discard_history'] for s in batch.state]),
-            'valid_actions_mask': torch.cat([s['valid_actions_mask'] for s in batch.state])
+            'hand_matrix': torch.cat([s['hand_matrix'] for s in batch.state]).to(self.device),
+            'discard_history': torch.cat([s['discard_history'] for s in batch.state]).to(self.device),
+            'valid_actions_mask': torch.stack([s['valid_actions_mask'] for s in batch.state]).to(self.device)
         }
         
         next_state_batch = {
-            'hand_matrix': torch.cat([s['hand_matrix'] for s in batch.next_state]),
-            'discard_history': torch.cat([s['discard_history'] for s in batch.next_state]),
-            'valid_actions_mask': torch.cat([s['valid_actions_mask'] for s in batch.next_state])
+            'hand_matrix': torch.cat([s['hand_matrix'] for s in batch.next_state]).to(self.device),
+            'discard_history': torch.cat([s['discard_history'] for s in batch.next_state]).to(self.device),
+            'valid_actions_mask': torch.stack([s['valid_actions_mask'] for s in batch.next_state]).to(self.device)
         }
         
-        action_batch = torch.tensor(batch.action).to(self.device)
-        reward_batch = torch.tensor(batch.reward).to(self.device)
-        done_batch = torch.tensor(batch.done).to(self.device)
+        action_batch = torch.tensor(batch.action, device=self.device).unsqueeze(1)
+        reward_batch = torch.tensor(batch.reward, device=self.device, dtype=torch.float32)
+        done_batch = torch.tensor(batch.done, device=self.device, dtype=torch.float32)
         
         # Compute Q(s_t, a)
         state_action_values = self.model(
             state_batch['hand_matrix'],
             state_batch['discard_history'],
             state_batch['valid_actions_mask']
-        ).gather(1, action_batch.unsqueeze(1))
+        ).gather(1, action_batch)
         
         # Compute V(s_{t+1}) for all next states
         with torch.no_grad():
-            next_state_values = self.model(
+            # Get Q-values from target network
+            next_q_values = self.target_model(
                 next_state_batch['hand_matrix'],
                 next_state_batch['discard_history'],
                 next_state_batch['valid_actions_mask']
-            ).max(1)[0]
+            )
+            
+            # Mask invalid actions
+            next_q_values = next_q_values.clone()
+            next_q_values[~next_state_batch['valid_actions_mask'].bool()] = float('-inf')
+            
+            # Get maximum Q-value for each next state
+            next_state_values = next_q_values.max(1)[0].detach()
             
             # Set V(s) = 0 for terminal states
-            next_state_values[done_batch] = 0
+            next_state_values = next_state_values * (1 - done_batch)
+            
+            # Compute expected Q values
+            expected_state_action_values = reward_batch + (GAMMA * next_state_values)
         
-        # Compute expected Q values
-        expected_state_action_values = reward_batch + GAMMA * next_state_values
+        # Normalize rewards for stable training
+        reward_mean = reward_batch.mean()
+        reward_std = reward_batch.std() + 1e-6
+        normalized_rewards = (reward_batch - reward_mean) / reward_std
         
-        # Compute loss
+        # Compute Huber loss
         loss = F.smooth_l1_loss(
             state_action_values,
             expected_state_action_values.unsqueeze(1)
         )
         
+        # Store loss for logging
+        self.current_loss = loss.item()
+        
         # Optimize
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 100)
+        # Clip gradients for stability
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
         
-        # Update target network
+        # Update target network periodically
         if self.steps_done % TARGET_UPDATE == 0:
-            self.model.load_state_dict(self.model.state_dict())
+            self.target_model.load_state_dict(self.model.state_dict())
         
         self.steps_done += 1
+        
+        return self.current_loss
         
     def save(self, filepath):
         """Save model checkpoint to file."""
         checkpoint = {
             'policy_state_dict': self.model.state_dict(),
-            'target_state_dict': self.model.state_dict(),
+            'target_state_dict': self.target_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'steps_done': self.steps_done
         }
@@ -254,11 +277,12 @@ class DQNAgent:
         """Load model checkpoint from file."""
         checkpoint = torch.load(filepath, map_location=self.device)
         self.model.load_state_dict(checkpoint['policy_state_dict'])
-        self.model.eval()
+        self.target_model.load_state_dict(checkpoint['target_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.steps_done = checkpoint['steps_done']
 
     def load_model(self, path):
         """Load model from path."""
         self.model.load_state_dict(torch.load(path, map_location=self.device))
-        self.model.eval() 
+        self.target_model.load_state_dict(torch.load(path, map_location=self.device))
+        self.target_model.eval() 

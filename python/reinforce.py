@@ -180,22 +180,24 @@ class PolicyNetwork(nn.Module):
 
 class REINFORCEAgent:
     """REINFORCE agent for Gin Rummy with baseline for variance reduction."""
-    def __init__(self, model=None, learning_rate=0.001):
+    def __init__(self, model=None, learning_rate=0.0003):  # Reduced learning rate
         self.model = model if model else PolicyNetwork()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             self.device = torch.device("mps")  # For Apple Silicon
         self.model.to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, eps=1e-5)
         self.saved_experiences = []
         self.gamma = 0.99
-        self.entropy_coef = 0.01
+        self.entropy_coef = 0.001  # Reduced entropy coefficient
         self.max_grad_norm = 0.5
         self.reward_scale = 0.1
+        self.value_loss_coef = 0.25  # Added value loss coefficient
         
-    def select_action(self, state):
+    def select_action(self, state, eval_mode=False):
         """Select an action based on policy network."""
         with torch.no_grad():
+            # Move state to device
             hand_matrix = state['hand_matrix'].to(self.device)
             discard_history = state['discard_history'].to(self.device)
             valid_actions_mask = state['valid_actions_mask'].to(self.device)
@@ -203,16 +205,27 @@ class REINFORCEAgent:
             # Get action probabilities from policy network
             action_probs, _ = self.model(hand_matrix, discard_history)
             
-            # Mask invalid actions
+            # Mask invalid actions and add small epsilon for numerical stability
             action_probs = action_probs.squeeze()
             action_probs = action_probs * valid_actions_mask
+            action_probs = action_probs / (action_probs.sum() + 1e-10)
             
-            # Normalize probabilities
-            action_probs = action_probs / action_probs.sum()
+            # Temperature scaling - lower temperature during evaluation
+            temperature = 0.5 if eval_mode else 1.0
+            action_probs = F.softmax(torch.log(action_probs + 1e-10) / temperature, dim=-1)
             
-            # Sample action from distribution
-            m = Categorical(action_probs)
-            action = m.sample().item()
+            if eval_mode:
+                # During evaluation, choose the action with highest probability
+                action = torch.argmax(action_probs).item()
+            else:
+                # During training, sample from the distribution
+                try:
+                    m = Categorical(action_probs)
+                    action = m.sample().item()
+                except Exception as e:
+                    print(f"Error sampling action: {e}")
+                    # Fallback to argmax if sampling fails
+                    action = torch.argmax(action_probs).item()
         
         return action
     
@@ -232,13 +245,14 @@ class REINFORCEAgent:
         R = 0
         
         # Scale rewards for better numerical stability
-        scaled_rewards = [r * self.reward_scale for r in rewards]
+        # No need to scale rewards since they're already in a good range (-25 to +35)
+        scaled_rewards = rewards
         
         for r in reversed(scaled_rewards):
             R = r + self.gamma * R
             returns.insert(0, R)
             
-        returns = torch.tensor(returns)
+        returns = torch.tensor(returns, device=self.device)
         
         # Normalize returns with a softer normalization
         if len(returns) > 1:
@@ -248,34 +262,13 @@ class REINFORCEAgent:
     
     def calculate_intermediate_reward(self, state: Dict[str, torch.Tensor]) -> float:
         """Calculate intermediate rewards based on game state."""
-        reward = 0.0
-        
-        # Reward for meld formation (+0.2 per card in valid set/run)
-        melds = self._find_melds(state['hand_matrix'])
-        reward += 0.2 * sum(len(meld) for meld in melds)
-        
-        # Penalty for deadwood (-0.1 per unmelded point)
-        deadwood = self._calculate_deadwood(state['hand_matrix'], melds)
-        reward -= 0.1 * deadwood
-        
-        # Large bonus for successful knocks and gin
-        if state.get('knocked', False):
-            reward += 5.0  # Increased from 1.0
-        if state.get('gin', False):
-            reward += 10.0  # Increased from 2.0
-            
-        # Additional reward for being close to gin/knock
-        if deadwood <= 5:
-            reward += 1.0
-        elif deadwood <= 10:
-            reward += 0.5
-            
-        return reward
+        # No intermediate rewards - using only environment rewards
+        return 0.0
     
     def train(self):
         """Train policy using collected experiences with baseline subtraction."""
         if not self.saved_experiences:
-            return
+            return {'policy_loss': 0, 'value_loss': 0, 'entropy': 0}
             
         states = [exp.state for exp in self.saved_experiences]
         actions = torch.tensor([exp.action for exp in self.saved_experiences], device=self.device)
@@ -285,7 +278,12 @@ class REINFORCEAgent:
         returns = self.calculate_returns(rewards)
         returns = returns.to(self.device)
         
-        # Get state values as baseline
+        # Initialize total losses as scalars
+        total_policy_loss = torch.tensor(0.0, device=self.device)
+        total_value_loss = torch.tensor(0.0, device=self.device)
+        total_entropy_loss = torch.tensor(0.0, device=self.device)
+        
+        # Get state values and calculate advantages
         state_values = []
         for state in states:
             hand_matrix = state['hand_matrix'].to(self.device)
@@ -296,10 +294,11 @@ class REINFORCEAgent:
         state_values = torch.cat(state_values)
         advantages = returns - state_values.detach()
         
-        # Calculate policy loss and value loss
-        policy_loss = 0
-        value_loss = 0
-        entropy_loss = 0
+        # Normalize advantages for more stable training
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        batch_size = len(states)
         
         for t, (state, action, advantage, ret) in enumerate(zip(states, actions, advantages, returns)):
             # Get action probabilities and value
@@ -307,30 +306,40 @@ class REINFORCEAgent:
             discard_history = state['discard_history'].to(self.device)
             probs, value = self.model(hand_matrix, discard_history)
             
-            # Mask invalid actions
+            # Mask invalid actions and normalize
             valid_actions_mask = state['valid_actions_mask'].to(self.device)
-            probs = probs * valid_actions_mask
+            probs = probs.squeeze() * valid_actions_mask
             probs = probs / (probs.sum() + 1e-10)
             
-            # Calculate losses
-            log_prob = torch.log(probs[0, action] + 1e-10)
-            policy_loss += -log_prob * advantage
-            value_loss += F.mse_loss(value.squeeze(), ret.unsqueeze(0))
-            entropy_loss += -torch.sum(probs * torch.log(probs + 1e-10))
+            # Calculate policy gradient loss with advantage normalization
+            log_prob = torch.log(probs[action] + 1e-10)
+            policy_loss = -log_prob * advantage.detach()  # Detach advantage
+            total_policy_loss = total_policy_loss + policy_loss
+            
+            # Calculate value loss - ensure tensor shapes match
+            value_target = ret.view(-1)  # Flatten target
+            value_pred = value.view(-1)  # Flatten prediction
+            value_loss = F.mse_loss(value_pred, value_target)
+            total_value_loss = total_value_loss + value_loss
+            
+            # Calculate entropy with reduced scale
+            entropy = -(probs * torch.log(probs + 1e-10)).sum()
+            entropy = torch.clamp(entropy, -2.0, 2.0)  # Clip entropy to reasonable range
+            total_entropy_loss = total_entropy_loss + entropy
         
-        # Combine losses and ensure they're scalar values
-        policy_loss = policy_loss.mean()
-        value_loss = value_loss.mean()
-        entropy_loss = entropy_loss.mean()
+        # Average losses
+        total_policy_loss = total_policy_loss / batch_size
+        total_value_loss = total_value_loss / batch_size
+        total_entropy_loss = total_entropy_loss / batch_size
         
-        # Combine losses
+        # Combine losses with adjusted coefficients
         total_loss = (
-            policy_loss +
-            0.5 * value_loss -
-            self.entropy_coef * entropy_loss
+            total_policy_loss +
+            self.value_loss_coef * total_value_loss -  # Value loss coefficient
+            self.entropy_coef * total_entropy_loss  # Entropy coefficient
         )
         
-        # Optimize
+        # Optimize with gradient clipping
         self.optimizer.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -340,9 +349,9 @@ class REINFORCEAgent:
         self.saved_experiences = []
         
         return {
-            'policy_loss': policy_loss.item(),
-            'value_loss': value_loss.item(),
-            'entropy': entropy_loss.item()
+            'policy_loss': total_policy_loss.item(),
+            'value_loss': total_value_loss.item(),
+            'entropy': total_entropy_loss.item()
         }
     
     def _find_melds(self, hand_matrix: torch.Tensor) -> List[List[int]]:

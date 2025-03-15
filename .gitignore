@@ -34,14 +34,29 @@ wheels/
 *.egg
 MANIFEST
 venv/
-fresh_env/
+ENV/
+env/
 
-# PyCharm
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE
 .idea/
-
-# VS Code
 .vscode/
-*.code-workspace
+*.swp
+*.swo
+
+# Project specific
+plots/
+metrics/
+models/
+*.json
+plot_results.py
+
+# Logs
+*.log
 
 # Model files and data
 *.pt
@@ -50,7 +65,6 @@ fresh_env/
 *.hdf5
 *.pkl
 *.model
-models/
 python/models/
 python/data/
 
@@ -66,7 +80,6 @@ java/MavenProject/retrain_data.json
 python/data/training_data*.json
 
 # Logs and results
-*.log
 *.png
 evaluation_results.json
 model_evaluation_results.png
@@ -112,32 +125,12 @@ python/data/*.json
 *.dat
 
 # Logs and temporary files
-*.log
 *.tmp
 .DS_Store
 
 # Large data files
-*.json
 *.tar.gz
-
-# Python virtual environments
-venv/
-fresh_env/
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Model files
-models/
-*.pt
-
-# IDE files
-.idea/
-.vscode/
 
 # OS specific files
 .DS_Store
 Thumbs.db
-
-# Logs
-*.log

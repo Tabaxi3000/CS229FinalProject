@@ -1,7 +1,0 @@
-/target/
-*.class
-doc
-.classpath
-.settings
-.project
-.factorypath
